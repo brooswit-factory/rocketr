@@ -1,0 +1,32 @@
+{
+  "name": "@brooswit/rocketr",
+  "version": "0.1.0",
+  "description": "Rocket.Chat bridge for Claude Code: a thatch MCP server with chat tools and a channel that pushes DMs and @mentions into a live session",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brooswit-factory/rocketr.git"
+  },
+  "bin": {
+    "rocketr": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test test/unit",
+    "check": "bun run typecheck && bun test test/unit"
+  },
+  "engines": {
+    "bun": ">=1.1"
+  },
+  "dependencies": {
+    "@brooswit/thatch": "^0.6.3",
+    "elysia": "^1.4.30"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}

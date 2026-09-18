@@ -1,0 +1,17 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test test/unit
+      - name: installer renders a unit systemd accepts
+        run: bash -n scripts/install.sh
