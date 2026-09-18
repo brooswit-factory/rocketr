@@ -5,7 +5,7 @@
     "": {
       "name": "@brooswit/rocketr",
       "dependencies": {
-        "@brooswit/thatch": "^0.6.3",
+        "@brooswit/thatch": "^0.7.0",
         "elysia": "^1.4.30",
       },
       "devDependencies": {
@@ -17,7 +17,7 @@
   "packages": {
     "@borewit/text-codec": ["@borewit/text-codec@0.2.2", "", {}, "sha512-DDaRehssg1aNrH4+2hnj1B7vnUGEjU6OIlyRdkMd0aUdIUvKXrJfXsy8LVtXAy7DRvYVluWbMspsRhz2lcW0mQ=="],
 
-    "@brooswit/thatch": ["@brooswit/thatch@0.6.3", "", { "dependencies": { "@modelcontextprotocol/sdk": "^1.30.0", "zod": "^4.0.0" }, "peerDependencies": { "elysia": ">=1.4" } }, "sha512-SFEFxWL3gkNguFmacIs4IqAxAI209WvWY0TcPNb/IBLPU6oj4/DuqPuhkXXa4hnYcrQBCanjRZqanNn3LUYLKg=="],
+    "@brooswit/thatch": ["@brooswit/thatch@0.7.0", "", { "dependencies": { "@modelcontextprotocol/sdk": "^1.30.0", "zod": "^4.0.0" }, "peerDependencies": { "elysia": ">=1.4" } }, "sha512-LmsoxZZlPEE44+A9IefUDPEcgzzAqyH7Y2wt5UBQvraCe8G8J3SVRigPwRI9JkVM3flU7oOO8CVWTL4q2LiC/g=="],
 
     "@hono/node-server": ["@hono/node-server@2.1.1", "", { "peerDependencies": { "hono": "^4" } }, "sha512-ELuehkj5VCBdgEw9zs+ivkKwyzzUCSQuE96YmiPvn1ECBoZCczbFXJLeEGMTYjphP6gydh4pHMqEYPVMYUVgQg=="],
 

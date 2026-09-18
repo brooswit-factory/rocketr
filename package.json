@@ -22,7 +22,7 @@
     "bun": ">=1.1"
   },
   "dependencies": {
-    "@brooswit/thatch": "^0.6.3",
+    "@brooswit/thatch": "^0.7.0",
     "elysia": "^1.4.30"
   },
   "devDependencies": {
