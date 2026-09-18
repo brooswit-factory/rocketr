@@ -1,7 +1,7 @@
 import type { Connection, Delivery, Frame } from "@brooswit/thatch";
 
 /** Headers safe to show in the web app. Everything else (authorization, cookie, ...) stays in thatch. */
-const SHOWN_HEADERS = ["x-agent-name", "user-agent"] as const;
+const SHOWN_HEADERS = ["x-agent-name", "x-rocketr-account", "user-agent"] as const;
 
 export interface AgentView {
   id: string;

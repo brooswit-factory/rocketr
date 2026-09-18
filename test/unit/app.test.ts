@@ -7,11 +7,17 @@ import { FakeRocketChat } from "./fake-rocketchat.js";
 let rcServer: FakeRocketChat, r: Rocketr, base: string;
 const conns: FakeConnection[] = [];
 const ON = { "x-rocketr-channel": "on" };
-const connect = async (headers: Record<string, string> = {}) => { const c = await FakeConnection.connect(base, { headers }); conns.push(c); return c; };
+const CLAUDE = { "x-rocketr-account": "claude" };
+const LEAD = { "x-rocketr-account": "lead" };
+/** Connects as @claude unless the headers name another account. */
+const connect = async (headers: Record<string, string> = {}) => { const c = await FakeConnection.connect(base, { headers: { ...CLAUDE, ...headers } }); conns.push(c); return c; };
 
 beforeEach(async () => {
   rcServer = new FakeRocketChat().start();
-  const cfg: Config = { url: rcServer.url, userId: "bot1", token: "tok", allow: ["boss", "ghost"], pollMs: 20, host: "127.0.0.1", port: 0 };
+  const cfg: Config = {
+    url: rcServer.url, allow: ["boss", "ghost"], pollMs: 20, host: "127.0.0.1", port: 0,
+    accounts: [{ name: "claude", userId: "bot1", token: "tok" }, { name: "lead", userId: "bot2", token: "tok2" }],
+  };
   r = await createRocketr(cfg);
   base = `http://127.0.0.1:${(await r.listen()).port}`;
 });
@@ -98,6 +104,50 @@ describe("channel", () => {
   });
 });
 
+describe("accounts", () => {
+  test("no fallback: a client that names no account is refused at connect", async () => {
+    await expect(FakeConnection.connect(base, { headers: {} })).rejects.toThrow();
+  });
+
+  test("an unknown account is refused at connect", async () => {
+    await expect(FakeConnection.connect(base, { headers: { "x-rocketr-account": "nobody" } })).rejects.toThrow();
+  });
+
+  test("each session speaks as its own account", async () => {
+    const a = await connect();
+    const b = await connect(LEAD);
+    expect((await a.callTool("whoami")).username).toBe("claude");
+    expect((await b.callTool("whoami")).username).toBe("lead");
+    await b.callTool("send_message", { room: "@boss", text: "from lead" });
+    expect(rcServer.sent.at(-1)).toEqual({ rid: "dm-boss-lead", msg: "from lead" });
+  });
+
+  test("a DM to one account reaches only that account's sessions", async () => {
+    const claude = await connect(ON);
+    const lead = await connect({ ...LEAD, ...ON });
+    await Bun.sleep(50);
+    rcServer.post("dm-boss-lead", "boss", "for the lead");
+    const f = await lead.nextFrame(3000);
+    expect(f.meta).toMatchObject({ account: "lead", room_id: "dm-boss-lead", sender: "boss" });
+    rcServer.post("dm-boss", "boss", "for claude");
+    expect((await claude.nextFrame(3000)).content).toBe("for claude"); // not "for the lead"
+  });
+
+  test("a message for an account with no session waits for that account, not another", async () => {
+    await connect(ON); // claude is listening
+    rcServer.post("dm-boss-lead", "boss", "lead is away");
+    await Bun.sleep(150);
+    expect(r.pending.map((p) => p.account)).toEqual(["lead"]);
+    const lead = await connect({ ...LEAD, ...ON });
+    expect((await lead.nextFrame(3000)).content).toBe("lead is away");
+  });
+
+  test("an account whose token signs in as someone else is rejected at startup", async () => {
+    const bad: Config = { url: rcServer.url, allow: [], pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
+    await expect(createRocketr(bad)).rejects.toThrow('account "claude" signs in as @lead');
+  });
+});
+
 describe("web app", () => {
   test("serves the page", async () => {
     const res = await fetch(base + "/");
@@ -110,7 +160,8 @@ describe("web app", () => {
     await c.callTool("whoami");
     const s = await (await fetch(base + "/api/snapshot")).json() as any;
     expect(s.agents).toHaveLength(1);
-    expect(s.agents[0]).toMatchObject({ name: "main", calls: 1 });
+    expect(s.agents[0]).toMatchObject({ name: "main", calls: 1, headers: { "x-rocketr-account": "claude" } });
+    expect(s.accounts.map((a: any) => a.username)).toEqual(["claude", "lead"]);
     expect(JSON.stringify(s)).not.toContain("secret");
   });
 

@@ -2,16 +2,26 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 
-export interface Config {
-  url: string;
+export interface AccountConfig {
+  /** The Rocket.Chat username. Connections select it with `x-rocketr-account: <name>`. */
+  name: string;
   userId: string;
   token: string;
+}
+
+export interface Config {
+  url: string;
+  /** Every account rocketr signs in as. There is no default: a connection must name one. */
+  accounts: AccountConfig[];
   /** Usernames whose DMs and @mentions are pushed into sessions. Empty = push nothing. */
   allow: string[];
   pollMs: number;
   host: string;
   port: number;
 }
+
+/** `rocketr-lead` → `ROCKETR_ACCOUNT_ROCKETR_LEAD_` */
+export const accountKey = (name: string) => `ROCKETR_ACCOUNT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_`;
 
 export const DEFAULT_ENV_FILE = join(homedir(), ".config", "rocketchat", "secrets.env");
 
@@ -35,10 +45,17 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const get = (k: string) => env[k] || fromFile[k] || "";
 
   const url = (get("ROCKETR_URL") || get("ROCKETCHAT_URL")).replace(/\/+$/, "");
-  const userId = get("ROCKETR_USER_ID");
-  const token = get("ROCKETR_TOKEN");
-  const missing = [!url && "ROCKETR_URL", !userId && "ROCKETR_USER_ID", !token && "ROCKETR_TOKEN"].filter(Boolean);
-  if (missing.length) throw new Error(`rocketr: missing ${missing.join(", ")} (env or ${file})`);
+  if (!url) throw new Error(`rocketr: missing ROCKETR_URL (env or ${file})`);
+
+  const names = get("ROCKETR_ACCOUNTS").split(",").map((s) => s.trim().replace(/^@/, "")).filter(Boolean);
+  if (!names.length) throw new Error(`rocketr: ROCKETR_ACCOUNTS is empty — list the usernames rocketr signs in as (env or ${file})`);
+  const accounts = names.map((name) => {
+    const k = accountKey(name);
+    const userId = get(`${k}USER_ID`), token = get(`${k}TOKEN`);
+    const missing = [!userId && `${k}USER_ID`, !token && `${k}TOKEN`].filter(Boolean);
+    if (missing.length) throw new Error(`rocketr: account ${name}: missing ${missing.join(", ")}`);
+    return { name, userId, token };
+  });
 
   const int = (k: string, d: number) => {
     const v = get(k);
@@ -49,7 +66,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   };
 
   return {
-    url, userId, token,
+    url, accounts,
     allow: get("ROCKETR_ALLOW").split(",").map((s) => s.trim().replace(/^@/, "")).filter(Boolean),
     pollMs: int("ROCKETR_POLL_MS", 3000),
     host: get("ROCKETR_HOST") || "127.0.0.1",

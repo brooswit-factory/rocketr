@@ -1,6 +1,6 @@
 # rocketr
 
-A daemon that puts Claude Code on Rocket.Chat. It is a [thatch](https://github.com/brooswit-factory/thatch)
+A daemon that puts Claude Code agents on Rocket.Chat, each as its own user. It is a [thatch](https://github.com/brooswit-factory/thatch)
 MCP server: Claude Code sessions connect to it over HTTP, get chat tools, and — through a
 **channel** — have DMs and @mentions pushed straight into the running session, so Claude can
 answer people in Rocket.Chat as they write. A small web app shows every connected agent and
@@ -12,12 +12,23 @@ Rocket.Chat ──poll──▶ rocketr ──channel push──▶ Claude Code 
      └──send_message────┘  └── http://127.0.0.1:8790/  (observer web app)
 ```
 
+## Accounts
+
+rocketr signs in as several Rocket.Chat users at once, one per agent. Every MCP connection names
+its account with the `x-rocketr-account` header (the Rocket.Chat username). **There is no default**:
+a client that names no account, or one rocketr doesn't know, is refused at connect (401). Tools act
+as that account, and only its own DMs and @mentions are pushed to its sessions.
+
+Accounts are listed in `ROCKETR_ACCOUNTS`; each has `ROCKETR_ACCOUNT_<NAME>_USER_ID` and `_TOKEN`
+(name upper-cased, non-alphanumerics → `_`, so `rocketr-lead` → `ROCKETR_ACCOUNT_ROCKETR_LEAD_`).
+rocketr refuses to start if a token signs in as a different username than its name.
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `whoami` | The Rocket.Chat account rocketr is signed in as |
-| `list_rooms` | Rooms it is in, with unread and mention counts |
+| `whoami` | The Rocket.Chat account this session speaks as |
+| `list_rooms` | Rooms that account is in, with unread and mention counts |
 | `read_messages` | Recent messages in a room or one thread, oldest first |
 | `send_message` | Post to a room, DM, or thread. The reply tool for channel events |
 
@@ -25,10 +36,10 @@ A room is an id, `#channel`, or `@username` (a DM, created on first use).
 
 ## The channel
 
-Every poll (3s by default) rocketr asks Rocket.Chat which subscriptions changed, reads the new
+Every poll (3s by default) rocketr asks Rocket.Chat, for each account, which subscriptions changed, reads the new
 messages, and pushes a `<channel source="rocketr" …>` event for:
 
-- any DM to its account, and
+- any DM to the account, and
 - any channel message that @mentions it,
 
 **from an allowed sender only** (`ROCKETR_ALLOW`). The check is on the sender's user id, never
@@ -37,7 +48,7 @@ path into your session. Usernames are resolved to ids at startup, so a renamed a
 cannot slip in by taking an allowed name.
 
 Tag attributes: `kind` (`dm`|`mention`), `room_id`, `room_name`, `room_type`, `sender`,
-`message_id`, `ts`, and `thread_id` when the message is in a thread. Reply by calling
+`message_id`, `ts`, `account` (who was addressed), and `thread_id` when the message is in a thread. Reply by calling
 `send_message` with the tag's `room_id` (and `thread_id`).
 
 Only messages created after the daemon started are pushed; restarts never replay history.
@@ -56,7 +67,7 @@ journalctl --user -u rocketr -f
 Credentials live in `~/.config/rocketchat/secrets.env` (see `.env.example`); set
 `ROCKETR_ENV_FILE` to use another file. Environment variables win over the file.
 
-The account should be a dedicated **bot** user with a personal access token, not an admin:
+Each account should be a dedicated **bot** user with a personal access token, not an admin:
 it can only see rooms it has been added to.
 
 ## Connect Claude Code
@@ -64,8 +75,8 @@ it can only see rooms it has been added to.
 Tools only, in any session:
 
 ```bash
-claude mcp add --scope user --transport http rocketr http://127.0.0.1:8790/mcp \
-  --header "x-agent-name: tools"
+claude mcp add --scope local --transport http rocketr http://127.0.0.1:8790/mcp \
+  --header "x-rocketr-account: <username>" --header "x-agent-name: tools"
 ```
 
 To also **receive** DMs and @mentions, the session must opt in twice: the connection sends
@@ -74,7 +85,7 @@ Put the server in the directory's `.mcp.json` (machine-local, git-ignored):
 
 ```json
 { "mcpServers": { "rocketr": { "type": "http", "url": "http://127.0.0.1:8790/mcp",
-  "headers": { "x-agent-name": "main", "x-rocketr-channel": "on" } } } }
+  "headers": { "x-rocketr-account": "<username>", "x-agent-name": "main", "x-rocketr-channel": "on" } } } }
 ```
 
 For a bakr-managed agent, bakr passes the channel flag at launch for servers named in its
@@ -88,12 +99,12 @@ claude --dangerously-load-development-channels server:rocketr
 Pushes are opt-in on purpose: Claude Code accepts a pushed frame even in a session that
 wasn't started with the channel flag, then drops it silently. If such a session counted as a
 delivery, the message would be marked read and never seen. Every opted-in session receives
-every push, and `x-agent-name` labels the session in the web app.
+push for its account, and `x-agent-name` labels the session in the web app.
 
 ## Web app
 
 Open <http://127.0.0.1:8790/>. Left: connected agents (click one to filter). Right: a live
-feed of tool calls (click to see arguments and result), inbound Rocket.Chat messages, pushes
+feed of tool calls (click to see arguments and result), each agent tagged with its account, inbound Rocket.Chat messages, pushes
 and their delivery result, connects and disconnects. Only `x-agent-name` and `user-agent` are
 shown; other headers such as `authorization` never leave the process.
 
@@ -105,7 +116,8 @@ tools as the bot, so don't expose it.
 | Variable | Default | |
 |---|---|---|
 | `ROCKETR_URL` | `ROCKETCHAT_URL` | Rocket.Chat base URL |
-| `ROCKETR_USER_ID`, `ROCKETR_TOKEN` | — | Bot personal access token |
+| `ROCKETR_ACCOUNTS` | — | Comma-separated usernames rocketr signs in as (required) |
+| `ROCKETR_ACCOUNT_<NAME>_USER_ID`, `_TOKEN` | — | Each account's personal access token |
 | `ROCKETR_ALLOW` | *(empty: push nothing)* | Comma-separated usernames whose DMs/mentions are pushed |
 | `ROCKETR_POLL_MS` | `3000` | Poll interval; backs off to 60s while Rocket.Chat is unreachable |
 | `ROCKETR_HOST` / `ROCKETR_PORT` | `127.0.0.1` / `8790` | Listen address |

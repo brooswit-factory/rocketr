@@ -99,7 +99,7 @@ function renderAgents() {
   const list = [...agents.values()].sort((a, b) => a.connectedAt - b.connectedAt);
   $("agents").innerHTML = list.length ? list.map((a) =>
     '<button class="agent' + (a.id === selected ? " sel" : "") + '" data-id="' + esc(a.id) + '"><div class="n">' + esc(a.name) + '</div><div class="s">' +
-    esc(a.id.slice(0, 8)) + " · since " + time(a.connectedAt) + " · " + a.calls + " call" + (a.calls === 1 ? "" : "s") + "</div></button>").join("")
+    esc("@" + (a.headers["x-rocketr-account"] || "?")) + " · " + esc(a.id.slice(0, 8)) + " · since " + time(a.connectedAt) + " · " + a.calls + " call" + (a.calls === 1 ? "" : "s") + "</div></button>").join("")
     : '<p class="empty">No agents connected.</p>';
 }
 
@@ -112,7 +112,7 @@ function apply(e) {
 
 async function load() {
   const s = await (await fetch("api/snapshot")).json();
-  $("who").textContent = "@" + s.self.username + " on " + s.server.replace(/^https?:\\/\\//, "") + " · v" + s.version;
+  $("who").textContent = s.accounts.map((a) => "@" + a.username).join(", ") + " on " + s.server.replace(/^https?:\\/\\//, "") + " · v" + s.version;
   $("pending").textContent = s.pending;
   agents = new Map(s.agents.map((a) => [a.id, a])); events = s.events;
   for (const e of events) { if (e.type === "connect") names.set(e.agent.id, e.agent.name); }

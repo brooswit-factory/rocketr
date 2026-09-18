@@ -24,17 +24,20 @@ export async function resolveRoom(rc: RocketChat, ref: string): Promise<Room> {
   try { return await rc.roomById(ref); } catch { return rc.roomByName(ref); }
 }
 
-export function buildTools(rc: RocketChat, self: User, url: string): Record<string, ToolDef<any>> {
+/** What a tool needs from the account a connection is bound to. */
+export interface AccountHandle { rc: RocketChat; self: User }
+
+export function buildTools(accountOf: (c: Connection) => AccountHandle, url: string): Record<string, ToolDef<any>> {
   return {
     whoami: tool({
-      description: "Who rocketr is signed in as on Rocket.Chat.",
+      description: "The Rocket.Chat account this session speaks as (chosen by its x-rocketr-account header).",
       input: {},
-      handler: () => ({ user_id: self._id, username: self.username, server: url }),
+      handler: (_a, c) => { const { self } = accountOf(c); return { user_id: self._id, username: self.username, server: url }; },
     }),
     list_rooms: tool({
-      description: "Rooms rocketr's account is in, with unread and mention counts.",
+      description: "Rooms this session's account is in, with unread and mention counts.",
       input: {},
-      handler: async () => (await rc.subscriptions()).map((s) => ({
+      handler: async (_a, c) => (await accountOf(c).rc.subscriptions()).map((s) => ({
         room_id: s.rid, name: s.fname || s.name, type: s.t, unread: s.unread, mentions: s.userMentions,
       })),
     }),
@@ -45,7 +48,8 @@ export function buildTools(rc: RocketChat, self: User, url: string): Record<stri
         count: z.number().int().min(1).max(100).optional().describe("How many, default 20"),
         thread_id: z.string().optional().describe("Read this thread instead of the room's main timeline"),
       },
-      handler: async ({ room, count = 20, thread_id }) => {
+      handler: async ({ room, count = 20, thread_id }, c) => {
+        const { rc } = accountOf(c);
         const msgs = thread_id ? await rc.threadMessages(thread_id, count) : await rc.history(await resolveRoom(rc, room), count);
         // Rocket.Chat answers newest-first; reverse, then a stable sort keeps same-millisecond messages in order
         return msgs.map(view).reverse().sort((a, b) => a.ts.localeCompare(b.ts));
@@ -60,7 +64,8 @@ export function buildTools(rc: RocketChat, self: User, url: string): Record<stri
         text: z.string().min(1).describe("Message text"),
         thread_id: z.string().optional().describe("Reply inside this thread"),
       },
-      handler: async ({ room, text, thread_id }) => {
+      handler: async ({ room, text, thread_id }, c) => {
+        const { rc } = accountOf(c);
         const r = await resolveRoom(rc, room);
         const m = await rc.send(r._id, text, thread_id);
         return { sent: true, message_id: m._id, room_id: r._id };
