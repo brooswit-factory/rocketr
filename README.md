@@ -69,12 +69,19 @@ claude mcp add --scope user --transport http rocketr http://127.0.0.1:8790/mcp \
 ```
 
 To also **receive** DMs and @mentions, the session must opt in twice: the connection sends
-`x-rocketr-channel: on`, and Claude Code is started **interactively** with the channel enabled
-(custom channels need the development flag while channels are in research preview):
+`x-rocketr-channel: on`, and Claude Code is launched with rocketr as a development channel.
+Put the server in the directory's `.mcp.json` (machine-local, git-ignored):
+
+```json
+{ "mcpServers": { "rocketr": { "type": "http", "url": "http://127.0.0.1:8790/mcp",
+  "headers": { "x-agent-name": "main", "x-rocketr-channel": "on" } } } }
+```
+
+For a bakr-managed agent, bakr passes the channel flag at launch for servers named in its
+`BAKR_MCP_NOTIFICATION_SERVERS` that the directory's `.mcp.json` configures, so include
+`rocketr` there. By hand, it is:
 
 ```bash
-claude mcp add --scope local --transport http rocketr http://127.0.0.1:8790/mcp \
-  --header "x-agent-name: main" --header "x-rocketr-channel: on"
 claude --dangerously-load-development-channels server:rocketr
 ```
 
