@@ -1,7 +1,7 @@
 {
   "name": "@brooswit/rocketr",
   "version": "0.1.0",
-  "description": "Rocket.Chat bridge for Claude Code: a thatch MCP server with chat tools and a channel that pushes DMs and @mentions into a live session",
+  "description": "Rocket.Chat bridge for Claude Code: a thatch MCP server with chat tools and a channel that pushes messages into a live session, per each room's notification preference",
   "license": "MIT",
   "type": "module",
   "private": true,
@@ -22,7 +22,7 @@
     "bun": ">=1.1"
   },
   "dependencies": {
-    "@brooswit/thatch": "^0.6.3",
+    "@brooswit/thatch": "^0.7.0",
     "elysia": "^1.4.30"
   },
   "devDependencies": {

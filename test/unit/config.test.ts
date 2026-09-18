@@ -21,14 +21,18 @@ describe("loadConfig", () => {
     expect(loadConfig({ ROCKETR_ENV_FILE: file(base) })).toEqual({
       url: "https://chat.example",
       accounts: [{ name: "claude", userId: "u1", token: "t1" }, { name: "rocketr-lead", userId: "u2", token: "t2" }],
-      allow: [], pollMs: 3000, host: "127.0.0.1", port: 8790,
+      defaultNotifications: "all", batchMs: 2000, pollMs: 3000, host: "127.0.0.1", port: 8790,
     });
   });
 
-  test("process env wins over the file; allowlist strips @ and blanks", () => {
-    const c = loadConfig({ ROCKETR_ENV_FILE: file(base + "ROCKETR_PORT=1\n"), ROCKETR_PORT: "9000", ROCKETR_ALLOW: "@boss, ,pal" });
+  test("process env wins over the file", () => {
+    const c = loadConfig({ ROCKETR_ENV_FILE: file(base + "ROCKETR_PORT=1\n"), ROCKETR_PORT: "9000", ROCKETR_DEFAULT_NOTIFICATIONS: "mentions" });
     expect(c.port).toBe(9000);
-    expect(c.allow).toEqual(["boss", "pal"]);
+    expect(c.defaultNotifications).toBe("mentions");
+  });
+
+  test("rejects an unknown notification level", () => {
+    expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_DEFAULT_NOTIFICATIONS: "loud" })).toThrow("ROCKETR_DEFAULT_NOTIFICATIONS");
   });
 
   test("requires the URL", () => {

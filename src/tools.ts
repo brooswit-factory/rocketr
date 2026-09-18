@@ -1,5 +1,6 @@
 import { z, type Connection, type ToolDef } from "@brooswit/thatch";
-import type { Message, RocketChat, Room, User } from "./rocketchat.js";
+import { NOTIFY_LEVELS, type Message, type NotifyLevel, type RocketChat, type Room, type User } from "./rocketchat.js";
+import { levelOf } from "./watcher.js";
 import type { Activity } from "./activity.js";
 
 /** Infers handler args from the zod shape, then erases to the registry's type. */
@@ -27,7 +28,7 @@ export async function resolveRoom(rc: RocketChat, ref: string): Promise<Room> {
 /** What a tool needs from the account a connection is bound to. */
 export interface AccountHandle { rc: RocketChat; self: User }
 
-export function buildTools(accountOf: (c: Connection) => AccountHandle, url: string): Record<string, ToolDef<any>> {
+export function buildTools(accountOf: (c: Connection) => AccountHandle, url: string, fallback: NotifyLevel): Record<string, ToolDef<any>> {
   return {
     whoami: tool({
       description: "The Rocket.Chat account this session speaks as (chosen by its x-rocketr-account header).",
@@ -69,6 +70,29 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
         const r = await resolveRoom(rc, room);
         const m = await rc.send(r._id, text, thread_id);
         return { sent: true, message_id: m._id, room_id: r._id };
+      },
+    }),
+    get_notifications: tool({
+      description:
+        "This account's notification level for a room, which decides what rocketr pushes into your session: " +
+        "all = every message; mentions = DMs, @mentions and replies in threads you follow; nothing = none.",
+      input: { room: ROOM },
+      handler: async ({ room }, c) => {
+        const { rc } = accountOf(c);
+        const sub = await rc.subscription((await resolveRoom(rc, room))._id);
+        return { room_id: sub.rid, name: sub.fname || sub.name, level: levelOf(sub, fallback), saved: sub.desktopNotifications ?? null, muted: !!sub.disableNotifications };
+      },
+    }),
+    set_notifications: tool({
+      description:
+        "Set this account's notification level for a room (Rocket.Chat's own per-room preference). Use `mentions` or " +
+        "`nothing` to quiet a noisy room; `all` to hear every message again.",
+      input: { room: ROOM, level: z.enum(NOTIFY_LEVELS).describe("all | mentions | nothing") },
+      handler: async ({ room, level }, c) => {
+        const { rc } = accountOf(c);
+        const r = await resolveRoom(rc, room);
+        await rc.saveNotification(r._id, level);
+        return { room_id: r._id, level };
       },
     }),
   };

@@ -1,15 +1,17 @@
 import { Elysia, type AnyElysia } from "elysia";
 import { thatch, type Connection, type Frame, type McpHandle } from "@brooswit/thatch";
 import type { Config } from "./config.js";
-import { RocketChat, type User } from "./rocketchat.js";
-import { Watcher, toFrame } from "./watcher.js";
+import { RocketChat, type Subscription, type User } from "./rocketchat.js";
+import { Batcher, Watcher, toFrame, type InboundEvent } from "./watcher.js";
 import { Activity } from "./activity.js";
 import { buildTools, instrument } from "./tools.js";
 import { page } from "./web.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 /** Undelivered frames kept for sessions that connect later. */
 const PENDING_MAX = 50;
+/** A room that never goes quiet still gets a turn every this many batch windows. */
+const BATCH_MAX_FACTOR = 5;
 /** The header a connection names its Rocket.Chat account with. Required: there is no default account. */
 export const ACCOUNT_HEADER = "x-rocketr-account";
 
@@ -47,7 +49,6 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
   const pending: Pending[] = [];
   let delivering = Promise.resolve(0);
 
-  const allow = new Set<string>();
   const clients: Array<{ rc: RocketChat; self: User }> = [];
   for (const a of cfg.accounts) {
     const rc = new RocketChat({ url: cfg.url, userId: a.userId, token: a.token, ...(deps.fetch ? { fetch: deps.fetch } : {}) });
@@ -56,11 +57,25 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
     if (self.username !== a.name) throw new Error(`rocketr: account "${a.name}" signs in as @${self.username} — fix ROCKETR_ACCOUNTS or its token`);
     clients.push({ rc, self });
   }
-  for (const username of cfg.allow) {
-    try { allow.add((await clients[0]!.rc.userByUsername(username))._id); }
-    catch (err) { log(`allowlist: cannot resolve @${username}: ${(err as Error).message}`); }
+
+  /**
+   * Give a room that never had a preference saved the agent default, so it shows (and can be changed) in Rocket.Chat's
+   * own UI. A room someone explicitly reset to "default" is left alone.
+   */
+  const adopt = async (rc: RocketChat, self: User, sub: Subscription) => {
+    if (sub.desktopNotifications || sub.disableNotifications !== undefined) return;
+    try {
+      await rc.saveNotification(sub.rid, cfg.defaultNotifications);
+      sub.desktopNotifications = cfg.defaultNotifications;
+      log(`@${self.username}: ${sub.fname || sub.name} notifications set to ${cfg.defaultNotifications}`);
+    } catch (err) {
+      log(`@${self.username}: cannot set notifications for ${sub.fname || sub.name}: ${(err as Error).message}`);
+    }
+  };
+  for (const { rc, self } of clients) {
+    try { for (const sub of await rc.subscriptions()) await adopt(rc, self, sub); }
+    catch (err) { log(`@${self.username}: cannot list rooms: ${(err as Error).message}`); }
   }
-  if (!allow.size) log("no allowed senders resolved (ROCKETR_ALLOW) — nothing will be pushed into sessions");
 
   const accountOf = (c: Connection): Account => {
     const a = accounts.get(c.headers[ACCOUNT_HEADER] ?? "");
@@ -72,7 +87,7 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
     serverInfo: { name: "rocketr", version: VERSION },
     // No fallback account: a client that doesn't name a known one is refused at connect.
     auth: (req) => accounts.has(req.headers.get(ACCOUNT_HEADER) ?? ""),
-    tools: instrument(buildTools(accountOf, cfg.url), activity),
+    tools: instrument(buildTools(accountOf, cfg.url, cfg.defaultNotifications), activity),
   });
   mcp.on("connect", (c) => activity.connected(c));
   mcp.on("disconnect", (c, reason) => activity.record({ type: "disconnect", agentId: c.id, reason }));
@@ -107,16 +122,27 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
   // serialize: the watchers and the retry timer must not push the same frame twice
   const deliver = () => (delivering = delivering.then(deliverOnce, deliverOnce));
 
+  /** Which account each event was addressed to (events themselves don't carry it). */
+  const accountOfEvent = new WeakMap<InboundEvent, string>();
+  const batcher = new Batcher({
+    quietMs: cfg.batchMs, maxMs: cfg.batchMs * BATCH_MAX_FACTOR,
+    flush: async (events) => {
+      const frame = toFrame(events);
+      const account = frame.meta.account = accountOfEvent.get(events[0]!)!;
+      activity.record({ type: "inbound", frame });
+      pending.push({ account, frame });
+      if (pending.length > PENDING_MAX) log(`dropped undelivered message ${pending.shift()!.frame.meta.message_id} (queue full)`);
+      await deliver();
+    },
+  });
+
   for (const { rc, self } of clients) {
     const watcher = new Watcher(rc, {
-      self, allow, pollMs: cfg.pollMs, log,
+      self, fallback: cfg.defaultNotifications, pollMs: cfg.pollMs, log,
+      onSubscription: (sub) => adopt(rc, self, sub),
       onEvent: async (e) => {
-        const frame = toFrame(e);
-        frame.meta.account = self.username;
-        activity.record({ type: "inbound", frame });
-        pending.push({ account: self.username, frame });
-        if (pending.length > PENDING_MAX) log(`dropped undelivered message ${pending.shift()!.frame.meta.message_id} (queue full)`);
-        await deliver();
+        accountOfEvent.set(e, self.username);
+        await batcher.add([self.username, e.room.id, e.message.tmid ?? ""].join("\0"), e);
       },
     });
     accounts.set(self.username, { rc, self, watcher });
@@ -155,6 +181,7 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
     async stop() {
       for (const a of accounts.values()) a.watcher.stop();
       if (retry) clearInterval(retry);
+      await batcher.flushAll();
       await mcp.closeAll();
       await app.stop(true); // close open observer streams too
     },

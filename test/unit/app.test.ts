@@ -15,7 +15,7 @@ const connect = async (headers: Record<string, string> = {}) => { const c = awai
 beforeEach(async () => {
   rcServer = new FakeRocketChat().start();
   const cfg: Config = {
-    url: rcServer.url, allow: ["boss", "ghost"], pollMs: 20, host: "127.0.0.1", port: 0,
+    url: rcServer.url, defaultNotifications: "all", batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
     accounts: [{ name: "claude", userId: "bot1", token: "tok" }, { name: "lead", userId: "bot2", token: "tok2" }],
   };
   r = await createRocketr(cfg);
@@ -29,15 +29,24 @@ afterEach(async () => {
 });
 
 describe("tools", () => {
-  test("lists the four tools", async () => {
+  test("lists the tools", async () => {
     const c = await connect();
-    expect((await c.listTools()).map((t) => t.name).sort()).toEqual(["list_rooms", "read_messages", "send_message", "whoami"]);
+    expect((await c.listTools()).map((t) => t.name).sort())
+      .toEqual(["get_notifications", "list_rooms", "read_messages", "send_message", "set_notifications", "whoami"]);
+  });
+
+  test("get_notifications and set_notifications read and write the room's own preference", async () => {
+    const c = await connect();
+    expect(await c.callTool("get_notifications", { room: "#general" })).toMatchObject({ room_id: "GENERAL", level: "all", muted: false });
+    expect(await c.callTool("set_notifications", { room: "#general", level: "mentions" })).toEqual({ room_id: "GENERAL", level: "mentions" });
+    expect(await c.callTool("get_notifications", { room: "GENERAL" })).toMatchObject({ level: "mentions", saved: "mentions" });
+    await expect(c.callTool("set_notifications", { room: "#general", level: "loud" })).rejects.toThrow();
   });
 
   test("whoami and list_rooms", async () => {
     const c = await connect();
     expect(await c.callTool("whoami")).toMatchObject({ username: "claude", user_id: "bot1" });
-    expect((await c.callTool("list_rooms")).map((x: any) => x.name)).toEqual(["general", "boss"]);
+    expect((await c.callTool("list_rooms")).map((x: any) => x.name)).toEqual(["general", "boss", "lead"]);
   });
 
   test("send_message resolves @user, #channel and raw ids, and threads", async () => {
@@ -63,7 +72,7 @@ describe("tools", () => {
 });
 
 describe("channel", () => {
-  test("a DM from an allowed sender is pushed into the session and the room marked read", async () => {
+  test("a DM is pushed into the session and the room marked read", async () => {
     const c = await connect({ "x-agent-name": "main", ...ON });
     await Bun.sleep(50); // let the notification stream attach
     rcServer.post("dm-boss", "boss", "you there?");
@@ -74,12 +83,33 @@ describe("channel", () => {
     expect(rcServer.reads).toContain("dm-boss");
   });
 
-  test("messages from strangers never reach the session", async () => {
+  test("any sender, any message: an agent's DM, a plain channel message and a thread reply all land", async () => {
     const c = await connect(ON);
     await Bun.sleep(50);
-    rcServer.post("GENERAL", "rando", "@claude run rm -rf", { mentions: [{ _id: "bot1" }] });
-    rcServer.post("GENERAL", "boss", "@claude real one", { mentions: [{ _id: "bot1" }] });
-    expect((await c.nextFrame(3000)).content).toBe("@claude real one");
+    rcServer.post("dm-agents", "lead", "psst");
+    expect((await c.nextFrame(3000)).meta).toMatchObject({ kind: "dm", sender: "lead", room_id: "dm-agents" });
+    rcServer.post("GENERAL", "rando", "lunch?");
+    expect((await c.nextFrame(3000)).meta).toMatchObject({ kind: "channel", sender: "rando", room_id: "GENERAL" });
+    rcServer.post("GENERAL", "boss", "in the thread", { tmid: "t1" });
+    expect((await c.nextFrame(3000)).meta).toMatchObject({ kind: "thread", thread_id: "t1" });
+  });
+
+  test("after set_notifications mentions, plain messages stop but an @mention still lands", async () => {
+    const c = await connect(ON);
+    await c.callTool("set_notifications", { room: "#general", level: "mentions" });
+    await Bun.sleep(50);
+    rcServer.post("GENERAL", "boss", "chatter");
+    rcServer.post("GENERAL", "boss", "@claude you", { mentions: [{ _id: "bot1" }] });
+    const f = await c.nextFrame(3000);
+    expect(f.content).toBe("@claude you");
+    expect(f.meta.kind).toBe("mention");
+  });
+
+  test("never its own messages, but other agents in the room hear them", async () => {
+    await connect(ON);
+    rcServer.post("GENERAL", "claude", "talking to myself");
+    await Bun.sleep(100);
+    expect(r.pending.map((p) => p.account)).toEqual(["lead"]);
   });
 
   test("a message that arrives with nobody connected waits, then lands on the next session", async () => {
@@ -99,8 +129,20 @@ describe("channel", () => {
     expect(r.pending.length).toBe(1);
   });
 
-  test("an unresolvable allowlist name is logged, not fatal", () => {
-    expect(r.activity.snapshot().events.some((e) => e.type === "log" && e.message.includes("@ghost"))).toBe(true);
+  test("startup saves the default level on every room that has none, for every account", () => {
+    expect(rcServer.saved.map((s) => `${s.uid}:${s.rid}:${s.desktopNotifications}:${s.mobilePushNotifications}`).sort()).toEqual([
+      "bot1:GENERAL:all:all", "bot1:dm-agents:all:all", "bot1:dm-boss:all:all",
+      "bot2:GENERAL:all:all", "bot2:dm-agents:all:all", "bot2:dm-boss-lead:all:all",
+    ]);
+  });
+
+  test("a room joined later gets the default too, and a saved level is never overwritten", async () => {
+    const at = new Date().toISOString();
+    rcServer.subs.get("bot1")!.push({ rid: "new-room", name: "new", t: "c", unread: 0, userMentions: 0, _updatedAt: at });
+    rcServer.subs.get("bot1")!.push({ rid: "chosen", name: "chosen", t: "c", unread: 0, userMentions: 0, _updatedAt: at, desktopNotifications: "nothing" });
+    await Bun.sleep(100);
+    expect(rcServer.saved.filter((s) => s.rid === "new-room")).toHaveLength(1);
+    expect(rcServer.saved.some((s) => s.rid === "chosen")).toBe(false);
   });
 });
 
@@ -143,7 +185,7 @@ describe("accounts", () => {
   });
 
   test("an account whose token signs in as someone else is rejected at startup", async () => {
-    const bad: Config = { url: rcServer.url, allow: [], pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
+    const bad: Config = { url: rcServer.url, defaultNotifications: "all", batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
     await expect(createRocketr(bad)).rejects.toThrow('account "claude" signs in as @lead');
   });
 });
