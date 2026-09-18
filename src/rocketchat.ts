@@ -19,6 +19,10 @@ export interface Message {
   attachments?: Array<{ title?: string; title_link?: string; text?: string }>;
 }
 
+/** A room's notification level, as Rocket.Chat's per-room "Notification Preferences" set it. */
+export type NotifyLevel = "all" | "mentions" | "nothing";
+export const NOTIFY_LEVELS = ["all", "mentions", "nothing"] as const;
+
 export interface Subscription {
   rid: string;
   name: string;
@@ -27,6 +31,16 @@ export interface Subscription {
   unread: number;
   userMentions: number;
   _updatedAt: string;
+  /** Absent until the room's preference is saved once ("default" after it is reset). */
+  desktopNotifications?: NotifyLevel | "default";
+  mobilePushNotifications?: NotifyLevel | "default";
+  /** "Mute all" in Rocket.Chat's UI. */
+  disableNotifications?: boolean;
+  muteGroupMentions?: boolean;
+  /** User ids this account ignores in the room. */
+  ignored?: string[];
+  /** Followed threads with unread replies. */
+  tunread?: string[];
 }
 
 export interface Room { _id: string; t: RoomType; name?: string; fname?: string }
@@ -67,6 +81,16 @@ export class RocketChat {
   /** Subscriptions changed since `since` (all of them when omitted). */
   async subscriptions(since?: Date) {
     return (await this.call<{ update: Subscription[] }>("subscriptions.get", { query: { updatedSince: since?.toISOString() } })).update;
+  }
+
+  async subscription(rid: string) {
+    return (await this.call<{ subscription: Subscription }>("subscriptions.getOne", { query: { roomId: rid } })).subscription;
+  }
+
+  /** Sets the desktop and the push level together: for an agent both mean "wake me for this". */
+  async saveNotification(rid: string, level: NotifyLevel) {
+    const notifications = { desktopNotifications: level, mobilePushNotifications: level };
+    await this.call("rooms.saveNotification", { body: { roomId: rid, notifications } });
   }
 
   /** Messages created or edited in a room after `since`. */

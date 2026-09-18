@@ -6,21 +6,22 @@ export class FakeRocketChat {
   readonly lead: User = { _id: "bot2", username: "lead", name: "Lead" };
   readonly users: User[] = [this.bot, this.lead, { _id: "u-boss", username: "boss" }, { _id: "u-rando", username: "rando" }];
   readonly tokens = new Map([["bot1", "tok"], ["bot2", "tok2"]]);
-  readonly rooms: Room[] = [{ _id: "GENERAL", t: "c", name: "general" }, { _id: "dm-boss", t: "d" }, { _id: "dm-boss-lead", t: "d" }];
+  readonly rooms: Room[] = [{ _id: "GENERAL", t: "c", name: "general" }, { _id: "dm-boss", t: "d" }, { _id: "dm-boss-lead", t: "d" }, { _id: "dm-agents", t: "d" }];
   /** Each bot's DM room with a given user. */
-  private readonly dms: Record<string, Record<string, string>> = { bot1: { boss: "dm-boss" }, bot2: { boss: "dm-boss-lead" } };
+  private readonly dms: Record<string, Record<string, string>> = { bot1: { boss: "dm-boss", lead: "dm-agents" }, bot2: { boss: "dm-boss-lead", claude: "dm-agents" } };
   readonly subs = new Map<string, Subscription[]>();
   readonly messages: Message[] = [];
   readonly sent: Array<{ rid: string; msg: string; tmid?: string }> = [];
   readonly reads: string[] = [];
+  readonly saved: Array<{ uid: string; rid: string; desktopNotifications?: string; mobilePushNotifications?: string }> = [];
   private n = 0;
   server!: ReturnType<typeof Bun.serve>;
 
   constructor() {
     const at = new Date(0).toISOString();
     const sub = (rid: string, name: string, t: Subscription["t"]): Subscription => ({ rid, name, t, unread: 0, userMentions: 0, _updatedAt: at });
-    this.subs.set("bot1", [sub("GENERAL", "general", "c"), sub("dm-boss", "boss", "d")]);
-    this.subs.set("bot2", [sub("GENERAL", "general", "c"), sub("dm-boss-lead", "boss", "d")]);
+    this.subs.set("bot1", [sub("GENERAL", "general", "c"), sub("dm-boss", "boss", "d"), sub("dm-agents", "lead", "d")]);
+    this.subs.set("bot2", [sub("GENERAL", "general", "c"), sub("dm-boss-lead", "boss", "d"), sub("dm-agents", "claude", "d")]);
   }
 
   get url() { return `http://127.0.0.1:${this.server.port}`; }
@@ -68,6 +69,14 @@ export class FakeRocketChat {
         return json({ success: true, message: m });
       }
       case "subscriptions.read": this.reads.push(body.rid); return json({ success: true });
+      case "subscriptions.getOne": { const s = this.subs.get(uid)?.find((x) => x.rid === q("roomId")); return json({ success: true, subscription: s ?? null }); }
+      case "rooms.saveNotification": {
+        const s = this.subs.get(uid)?.find((x) => x.rid === body.roomId);
+        if (!s) return json({ success: false, error: "not subscribed" }, 400);
+        Object.assign(s, body.notifications, { _updatedAt: new Date().toISOString() });
+        this.saved.push({ uid, rid: body.roomId, ...body.notifications });
+        return json({ success: true });
+      }
       default: return json({ success: false, error: `no route ${route}` }, 404);
     }
   }

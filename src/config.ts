@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
+import { NOTIFY_LEVELS, type NotifyLevel } from "./rocketchat.js";
 
 export interface AccountConfig {
   /** The Rocket.Chat username. Connections select it with `x-rocketr-account: <name>`. */
@@ -13,8 +14,13 @@ export interface Config {
   url: string;
   /** Every account rocketr signs in as. There is no default: a connection must name one. */
   accounts: AccountConfig[];
-  /** Usernames whose DMs and @mentions are pushed into sessions. Empty = push nothing. */
-  allow: string[];
+  /**
+   * Level saved on each account's rooms that have no preference yet (at startup and when the account joins one),
+   * and assumed for a room until that save lands. Each room's own Rocket.Chat preference then decides what is pushed.
+   */
+  defaultNotifications: NotifyLevel;
+  /** Messages in one room and thread arriving within this many ms of each other become one turn. 0 = no batching. */
+  batchMs: number;
   pollMs: number;
   host: string;
   port: number;
@@ -65,9 +71,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     return n;
   };
 
+  const level = get("ROCKETR_DEFAULT_NOTIFICATIONS") || "all";
+  if (!(NOTIFY_LEVELS as readonly string[]).includes(level)) {
+    throw new Error(`rocketr: ROCKETR_DEFAULT_NOTIFICATIONS must be one of ${NOTIFY_LEVELS.join(", ")}, got "${level}"`);
+  }
+
   return {
     url, accounts,
-    allow: get("ROCKETR_ALLOW").split(",").map((s) => s.trim().replace(/^@/, "")).filter(Boolean),
+    defaultNotifications: level as NotifyLevel,
+    batchMs: int("ROCKETR_BATCH_MS", 2000),
     pollMs: int("ROCKETR_POLL_MS", 3000),
     host: get("ROCKETR_HOST") || "127.0.0.1",
     port: int("ROCKETR_PORT", 8790),
