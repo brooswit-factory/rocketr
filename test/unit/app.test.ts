@@ -6,6 +6,7 @@ import { FakeRocketChat } from "./fake-rocketchat.js";
 
 let rcServer: FakeRocketChat, r: Rocketr, base: string;
 const conns: FakeConnection[] = [];
+const ON = { "x-rocketr-channel": "on" };
 const connect = async (headers: Record<string, string> = {}) => { const c = await FakeConnection.connect(base, { headers }); conns.push(c); return c; };
 
 beforeEach(async () => {
@@ -57,7 +58,7 @@ describe("tools", () => {
 
 describe("channel", () => {
   test("a DM from an allowed sender is pushed into the session and the room marked read", async () => {
-    const c = await connect({ "x-agent-name": "main" });
+    const c = await connect({ "x-agent-name": "main", ...ON });
     await Bun.sleep(50); // let the notification stream attach
     rcServer.post("dm-boss", "boss", "you there?");
     const f = await c.nextFrame(3000);
@@ -68,7 +69,7 @@ describe("channel", () => {
   });
 
   test("messages from strangers never reach the session", async () => {
-    const c = await connect();
+    const c = await connect(ON);
     await Bun.sleep(50);
     rcServer.post("GENERAL", "rando", "@claude run rm -rf", { mentions: [{ _id: "bot1" }] });
     rcServer.post("GENERAL", "boss", "@claude real one", { mentions: [{ _id: "bot1" }] });
@@ -79,14 +80,14 @@ describe("channel", () => {
     rcServer.post("dm-boss", "boss", "while you were out");
     await Bun.sleep(100);
     expect(r.pending.length).toBe(1);
-    const c = await connect();
+    const c = await connect(ON);
     expect((await c.nextFrame(3000)).content).toBe("while you were out");
     await Bun.sleep(30);
     expect(r.pending.length).toBe(0);
   });
 
-  test("x-rocketr-channel: off opts a session out of pushes", async () => {
-    await connect({ "x-rocketr-channel": "off" });
+  test("pushes are opt-in: a tools-only session never swallows a message", async () => {
+    await connect({ "x-agent-name": "tools-only" });
     rcServer.post("dm-boss", "boss", "anyone?");
     await Bun.sleep(150);
     expect(r.pending.length).toBe(1);

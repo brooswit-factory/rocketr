@@ -61,22 +61,27 @@ it can only see rooms it has been added to.
 
 ## Connect Claude Code
 
+Tools only, in any session:
+
 ```bash
 claude mcp add --scope user --transport http rocketr http://127.0.0.1:8790/mcp \
-  --header "x-agent-name: main"
+  --header "x-agent-name: tools"
 ```
 
-Tools work in any session. To receive pushed messages, start Claude Code **interactively**
-with the channel enabled — custom channels need the development flag while channels are in
-research preview:
+To also **receive** DMs and @mentions, the session must opt in twice: the connection sends
+`x-rocketr-channel: on`, and Claude Code is started **interactively** with the channel enabled
+(custom channels need the development flag while channels are in research preview):
 
 ```bash
+claude mcp add --scope local --transport http rocketr http://127.0.0.1:8790/mcp \
+  --header "x-agent-name: main" --header "x-rocketr-channel: on"
 claude --dangerously-load-development-channels server:rocketr
 ```
 
-`x-agent-name` is how the session is labelled in the web app. A session that should get the
-tools but never pushes adds `--header "x-rocketr-channel: off"`. Every listening session
-receives every push.
+Pushes are opt-in on purpose: Claude Code accepts a pushed frame even in a session that
+wasn't started with the channel flag, then drops it silently. If such a session counted as a
+delivery, the message would be marked read and never seen. Every opted-in session receives
+every push, and `x-agent-name` labels the session in the web app.
 
 ## Web app
 

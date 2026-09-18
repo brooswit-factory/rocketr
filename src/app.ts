@@ -48,8 +48,12 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
 
   const pending: Frame[] = [];
   let delivering = Promise.resolve(0);
-  /** A session opts out of pushes (tools only) with `x-rocketr-channel: off`. */
-  const listening = () => mcp.connections.filter((c) => c.headers["x-rocketr-channel"] !== "off");
+  /**
+   * Pushes are opt-in (`x-rocketr-channel: on`). Claude Code accepts a frame on the wire even when the
+   * session wasn't started with the channel flag, then drops it silently — so a tools-only session must
+   * never count as a delivery, or the message is marked read and lost.
+   */
+  const listening = () => mcp.connections.filter((c) => c.headers["x-rocketr-channel"] === "on");
 
   const deliverOnce = async () => {
     let landed = 0;
