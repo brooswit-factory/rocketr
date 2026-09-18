@@ -1,0 +1,19 @@
+[Unit]
+Description=rocketr — Rocket.Chat bridge for Claude Code (thatch MCP server + channel + observer web app)
+# Needs the network to reach Rocket.Chat; the watcher backs off and retries while it is down.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# bun is often outside the user manager's default PATH (e.g. ~/.bun/bin).
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Credentials are read from ~/.config/rocketchat/secrets.env (override with ROCKETR_ENV_FILE).
+# ExecStart is a TEMPLATE: scripts/install.sh substitutes both placeholders with this
+# machine's resolved bun and clone paths, escaped for systemd's quoting rules.
+ExecStart="@@BUN_PATH@@" run "@@REPO_ROOT@@/src/index.ts"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
