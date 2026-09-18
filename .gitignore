@@ -6,3 +6,4 @@ dist/
 !.env.example
 # machine-local MCP config (read by bakr at launch)
 .mcp.json
+.claude/settings.local.json
