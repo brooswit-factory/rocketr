@@ -184,6 +184,17 @@ describe("accounts", () => {
     expect((await lead.nextFrame(3000)).content).toBe("lead is away");
   });
 
+  test("the queue is capped per account: a busy account with no session can't evict another's message", async () => {
+    rcServer.post("dm-boss", "boss", "for claude, queued first");
+    await Bun.sleep(60);
+    for (let i = 0; i < 60; i++) rcServer.post("dm-boss-lead", "boss", `lead ${i}`);
+    await Bun.sleep(150);
+    expect(r.pending.filter((p) => p.account === "lead")).toHaveLength(50);
+    expect(r.pending.filter((p) => p.account === "lead")[0]!.frame.content).toBe("lead 10"); // oldest of lead's own dropped
+    const c = await connect(ON);
+    expect((await c.nextFrame(3000)).content).toBe("for claude, queued first");
+  });
+
   test("an account whose token signs in as someone else is rejected at startup", async () => {
     const bad: Config = { url: rcServer.url, defaultNotifications: "all", batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
     await expect(createRocketr(bad)).rejects.toThrow('account "claude" signs in as @lead');

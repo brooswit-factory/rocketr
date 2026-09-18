@@ -8,7 +8,10 @@ import { buildTools, instrument } from "./tools.js";
 import { page } from "./web.js";
 
 export const VERSION = "0.3.0";
-/** Undelivered frames kept for sessions that connect later. */
+/**
+ * Undelivered frames kept per account for sessions that connect later. Per account, so an account with no live
+ * session (whose rooms are all at `all`) can't push out frames meant for an agent that is listening.
+ */
 const PENDING_MAX = 50;
 /** A room that never goes quiet still gets a turn every this many batch windows. */
 const BATCH_MAX_FACTOR = 5;
@@ -131,7 +134,11 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
       const account = frame.meta.account = accountOfEvent.get(events[0]!)!;
       activity.record({ type: "inbound", frame });
       pending.push({ account, frame });
-      if (pending.length > PENDING_MAX) log(`dropped undelivered message ${pending.shift()!.frame.meta.message_id} (queue full)`);
+      const own = pending.filter((p) => p.account === account);
+      if (own.length > PENDING_MAX) {
+        pending.splice(pending.indexOf(own[0]!), 1);
+        log(`@${account}: dropped undelivered message ${own[0]!.frame.meta.message_id} (queue full)`);
+      }
       await deliver();
     },
   });
