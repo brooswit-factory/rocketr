@@ -90,7 +90,12 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
     serverInfo: { name: "rocketr", version: VERSION },
     // No fallback account: a client that doesn't name a known one is refused at connect.
     auth: (req) => accounts.has(req.headers.get(ACCOUNT_HEADER) ?? ""),
-    tools: instrument(buildTools(accountOf, cfg.url, cfg.defaultNotifications), activity),
+    tools: instrument(buildTools(accountOf, cfg.url, cfg.defaultNotifications, (account, roomId, level) => {
+      if (level !== "nothing") return;
+      for (const item of [...pending]) {
+        if (item.account === account && item.frame.meta.room_id === roomId) pending.splice(pending.indexOf(item), 1);
+      }
+    }), activity),
   });
   mcp.on("connect", (c) => activity.connected(c));
   mcp.on("disconnect", (c, reason) => activity.record({ type: "disconnect", agentId: c.id, reason }));

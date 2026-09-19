@@ -105,6 +105,16 @@ describe("channel", () => {
     expect(f.meta.kind).toBe("mention");
   });
 
+  test("muting a room discards its already-queued frames for that account", async () => {
+    rcServer.post("dm-boss-lead", "boss", "hold this");
+    await Bun.sleep(100);
+    expect(r.pending.map((item) => item.account)).toEqual(["lead"]);
+
+    const c = await connect({ ...LEAD, ...ON });
+    await c.callTool("set_notifications", { room: "@boss", level: "nothing" });
+    expect(r.pending).toEqual([]);
+  });
+
   test("never its own messages, but other agents in the room hear them", async () => {
     await connect(ON);
     rcServer.post("GENERAL", "claude", "talking to myself");

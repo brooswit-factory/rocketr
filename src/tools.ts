@@ -28,7 +28,9 @@ export async function resolveRoom(rc: RocketChat, ref: string): Promise<Room> {
 /** What a tool needs from the account a connection is bound to. */
 export interface AccountHandle { rc: RocketChat; self: User }
 
-export function buildTools(accountOf: (c: Connection) => AccountHandle, url: string, fallback: NotifyLevel): Record<string, ToolDef<any>> {
+export type NotificationChange = (account: string, roomId: string, level: NotifyLevel) => void;
+
+export function buildTools(accountOf: (c: Connection) => AccountHandle, url: string, fallback: NotifyLevel, onNotificationChange?: NotificationChange): Record<string, ToolDef<any>> {
   return {
     whoami: tool({
       description: "The Rocket.Chat account this session speaks as (chosen by its x-rocketr-account header).",
@@ -89,9 +91,10 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
         "`nothing` to quiet a noisy room; `all` to hear every message again.",
       input: { room: ROOM, level: z.enum(NOTIFY_LEVELS).describe("all | mentions | nothing") },
       handler: async ({ room, level }, c) => {
-        const { rc } = accountOf(c);
+        const { rc, self } = accountOf(c);
         const r = await resolveRoom(rc, room);
         await rc.saveNotification(r._id, level);
+        onNotificationChange?.(self.username, r._id, level);
         return { room_id: r._id, level };
       },
     }),
