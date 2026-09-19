@@ -71,7 +71,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     return n;
   };
 
-  const level = get("ROCKETR_DEFAULT_NOTIFICATIONS") || "all";
+  // Public rooms are noisy by default. Agents still receive DMs, @mentions, and
+  // replies in followed threads, while a deliberate room setting can opt into all.
+  const level = get("ROCKETR_DEFAULT_NOTIFICATIONS") || "mentions";
   if (!(NOTIFY_LEVELS as readonly string[]).includes(level)) {
     throw new Error(`rocketr: ROCKETR_DEFAULT_NOTIFICATIONS must be one of ${NOTIFY_LEVELS.join(", ")}, got "${level}"`);
   }

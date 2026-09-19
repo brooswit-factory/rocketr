@@ -21,7 +21,7 @@ describe("loadConfig", () => {
     expect(loadConfig({ ROCKETR_ENV_FILE: file(base) })).toEqual({
       url: "https://chat.example",
       accounts: [{ name: "claude", userId: "u1", token: "t1" }, { name: "rocketr-lead", userId: "u2", token: "t2" }],
-      defaultNotifications: "all", batchMs: 2000, pollMs: 3000, host: "127.0.0.1", port: 8790,
+      defaultNotifications: "mentions", batchMs: 2000, pollMs: 3000, host: "127.0.0.1", port: 8790,
     });
   });
 

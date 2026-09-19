@@ -157,7 +157,15 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
     .get("/", () => new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } }))
     .get("/api/snapshot", () => ({
       accounts: [...accounts.values()].map((a) => ({ id: a.self._id, username: a.self.username })),
-      server: cfg.url, version: VERSION, pending: pending.length, ...activity.snapshot(),
+      server: cfg.url,
+      version: VERSION,
+      pending: pending.length,
+      // Counts only: enough to diagnose a stalled account without exposing message contents.
+      pendingByAccount: pending.reduce<Record<string, number>>((counts, item) => {
+        counts[item.account] = (counts[item.account] ?? 0) + 1;
+        return counts;
+      }, {}),
+      ...activity.snapshot(),
     }))
     .get("/api/stream", ({ request }) => {
       let off = () => {};

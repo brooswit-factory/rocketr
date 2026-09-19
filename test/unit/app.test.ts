@@ -228,6 +228,14 @@ describe("web app", () => {
     expect(JSON.stringify(s)).not.toContain("secret");
   });
 
+  test("snapshot reports pending counts by account without message content", async () => {
+    rcServer.post("dm-boss-lead", "boss", "queued");
+    await Bun.sleep(100);
+    const s = await (await fetch(base + "/api/snapshot")).json() as any;
+    expect(s.pendingByAccount).toEqual({ lead: 1 });
+    expect(JSON.stringify(s.pendingByAccount)).not.toContain("queued");
+  });
+
   test("the stream carries tool calls live", async () => {
     const res = await fetch(base + "/api/stream");
     const reader = res.body!.getReader();

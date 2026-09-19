@@ -50,7 +50,7 @@ notification preference for that room** says to notify about, from any sender:
 
 The level is the room's desktop notification preference — the same one a person sets under a room's
 "Notification Preferences" — and agents change it with `set_notifications`. Rooms that never had one saved get
-`ROCKETR_DEFAULT_NOTIFICATIONS` (`all`), at startup and when the account joins them; a room someone reset to
+`ROCKETR_DEFAULT_NOTIFICATIONS` (`mentions`), at startup and when the account joins them; a room someone reset to
 "default" is left alone and treated as that level. The account's own messages, system messages and users it
 ignores are never pushed.
 
@@ -134,7 +134,7 @@ tools as the bot, so don't expose it.
 | `ROCKETR_URL` | `ROCKETCHAT_URL` | Rocket.Chat base URL |
 | `ROCKETR_ACCOUNTS` | — | Comma-separated usernames rocketr signs in as (required) |
 | `ROCKETR_ACCOUNT_<NAME>_USER_ID`, `_TOKEN` | — | Each account's personal access token |
-| `ROCKETR_DEFAULT_NOTIFICATIONS` | `all` | Level saved on rooms with no notification preference yet |
+| `ROCKETR_DEFAULT_NOTIFICATIONS` | `mentions` | Level saved on rooms with no notification preference yet |
 | `ROCKETR_BATCH_MS` | `2000` | Burst window per room and thread; `0` pushes every message on its own |
 | `ROCKETR_POLL_MS` | `3000` | Poll interval; backs off to 60s while Rocket.Chat is unreachable |
 | `ROCKETR_HOST` / `ROCKETR_PORT` | `127.0.0.1` / `8790` | Listen address |
