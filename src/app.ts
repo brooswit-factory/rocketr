@@ -100,21 +100,18 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
    * accepts a frame on the wire even when the session wasn't started with the channel flag, then drops it
    * silently — so a tools-only session must never count as a delivery, or the message is marked read and lost.
    */
-  const listening = (account: string) =>
-    mcp.connections.filter((c) => c.headers["x-rocketr-channel"] === "on" && c.headers[ACCOUNT_HEADER] === account);
+  const listening = (account: string) => mcp.connections
+    .filter((c) => c.headers["x-rocketr-channel"] === "on" && c.headers[ACCOUNT_HEADER] === account)
+    .sort((a, b) => b.connectedAt - a.connectedAt)[0];
 
   const deliverOnce = async () => {
     let landed = 0;
     for (const item of [...pending]) {
-      const targets = listening(item.account);
-      if (!targets.length) continue;
-      let ok = false;
-      for (const c of targets) {
-        const d = await c.send(item.frame);
-        activity.record({ type: "push", agentId: c.id, messageId: item.frame.meta.message_id ?? "", delivery: d });
-        ok ||= d.claim === "C2";
-      }
-      if (!ok) continue;
+      const target = listening(item.account);
+      if (!target) continue;
+      const delivery = await target.send(item.frame);
+      activity.record({ type: "push", agentId: target.id, messageId: item.frame.meta.message_id ?? "", delivery });
+      if (delivery.claim !== "C2") continue;
       pending.splice(pending.indexOf(item), 1);
       landed++;
       const rid = item.frame.meta.room_id;

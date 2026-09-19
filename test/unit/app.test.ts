@@ -122,6 +122,16 @@ describe("channel", () => {
     expect(r.pending.length).toBe(0);
   });
 
+  test("a reconnect supersedes an older channel session for exactly-once delivery", async () => {
+    await connect(ON);
+    const current = await connect(ON);
+    await Bun.sleep(50);
+    rcServer.post("dm-boss", "boss", "one live turn only");
+    expect((await current.nextFrame(3000)).content).toBe("one live turn only");
+    await Bun.sleep(30);
+    expect(r.activity.snapshot().events.filter((event) => event.type === "push")).toHaveLength(1);
+  });
+
   test("pushes are opt-in: a tools-only session never swallows a message", async () => {
     await connect({ "x-agent-name": "tools-only" });
     rcServer.post("dm-boss", "boss", "anyone?");
