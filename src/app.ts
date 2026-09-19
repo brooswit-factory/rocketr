@@ -66,11 +66,13 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
    * own UI. A room someone explicitly reset to "default" is left alone.
    */
   const adopt = async (rc: RocketChat, self: User, sub: Subscription) => {
-    if (sub.desktopNotifications || sub.disableNotifications !== undefined) return;
+    const migrate = cfg.migrateLegacyAllToMentions && sub.desktopNotifications === "all";
+    if (!migrate && (sub.desktopNotifications || sub.disableNotifications !== undefined)) return;
+    const level = migrate ? "mentions" : cfg.defaultNotifications;
     try {
-      await rc.saveNotification(sub.rid, cfg.defaultNotifications);
-      sub.desktopNotifications = cfg.defaultNotifications;
-      log(`@${self.username}: ${sub.fname || sub.name} notifications set to ${cfg.defaultNotifications}`);
+      await rc.saveNotification(sub.rid, level);
+      sub.desktopNotifications = level;
+      log(`@${self.username}: ${sub.fname || sub.name} notifications set to ${level}`);
     } catch (err) {
       log(`@${self.username}: cannot set notifications for ${sub.fname || sub.name}: ${(err as Error).message}`);
     }

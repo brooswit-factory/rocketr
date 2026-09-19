@@ -19,6 +19,8 @@ export interface Config {
    * and assumed for a room until that save lands. Each room's own Rocket.Chat preference then decides what is pushed.
    */
   defaultNotifications: NotifyLevel;
+  /** One-shot recovery switch: replace legacy broad room preferences with mention-only delivery. */
+  migrateLegacyAllToMentions: boolean;
   /** Messages in one room and thread arriving within this many ms of each other become one turn. 0 = no batching. */
   batchMs: number;
   pollMs: number;
@@ -70,6 +72,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     if (!Number.isInteger(n) || n < 0) throw new Error(`rocketr: ${k} must be a non-negative integer, got "${v}"`);
     return n;
   };
+  const bool = (k: string) => {
+    const v = get(k);
+    if (!v) return false;
+    if (v === "1" || v === "true") return true;
+    if (v === "0" || v === "false") return false;
+    throw new Error(`rocketr: ${k} must be true or false, got "${v}"`);
+  };
 
   // Public rooms are noisy by default. Agents still receive DMs, @mentions, and
   // replies in followed threads, while a deliberate room setting can opt into all.
@@ -81,6 +90,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   return {
     url, accounts,
     defaultNotifications: level as NotifyLevel,
+    migrateLegacyAllToMentions: bool("ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS"),
     batchMs: int("ROCKETR_BATCH_MS", 2000),
     pollMs: int("ROCKETR_POLL_MS", 3000),
     host: get("ROCKETR_HOST") || "127.0.0.1",

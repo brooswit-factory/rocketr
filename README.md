@@ -135,6 +135,7 @@ tools as the bot, so don't expose it.
 | `ROCKETR_ACCOUNTS` | — | Comma-separated usernames rocketr signs in as (required) |
 | `ROCKETR_ACCOUNT_<NAME>_USER_ID`, `_TOKEN` | — | Each account's personal access token |
 | `ROCKETR_DEFAULT_NOTIFICATIONS` | `mentions` | Level saved on rooms with no notification preference yet |
+| `ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS` | `false` | One startup only: convert saved `all` preferences to `mentions`; reversible per room |
 | `ROCKETR_BATCH_MS` | `2000` | Burst window per room and thread; `0` pushes every message on its own |
 | `ROCKETR_POLL_MS` | `3000` | Poll interval; backs off to 60s while Rocket.Chat is unreachable |
 | `ROCKETR_HOST` / `ROCKETR_PORT` | `127.0.0.1` / `8790` | Listen address |

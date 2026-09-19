@@ -15,7 +15,7 @@ const connect = async (headers: Record<string, string> = {}) => { const c = awai
 beforeEach(async () => {
   rcServer = new FakeRocketChat().start();
   const cfg: Config = {
-    url: rcServer.url, defaultNotifications: "all", batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+    url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
     accounts: [{ name: "claude", userId: "bot1", token: "tok" }, { name: "lead", userId: "bot2", token: "tok2" }],
   };
   r = await createRocketr(cfg);
@@ -216,7 +216,7 @@ describe("accounts", () => {
   });
 
   test("an account whose token signs in as someone else is rejected at startup", async () => {
-    const bad: Config = { url: rcServer.url, defaultNotifications: "all", batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
+    const bad: Config = { url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
     await expect(createRocketr(bad)).rejects.toThrow('account "claude" signs in as @lead');
   });
 });

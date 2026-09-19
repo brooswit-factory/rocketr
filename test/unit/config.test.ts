@@ -21,7 +21,7 @@ describe("loadConfig", () => {
     expect(loadConfig({ ROCKETR_ENV_FILE: file(base) })).toEqual({
       url: "https://chat.example",
       accounts: [{ name: "claude", userId: "u1", token: "t1" }, { name: "rocketr-lead", userId: "u2", token: "t2" }],
-      defaultNotifications: "mentions", batchMs: 2000, pollMs: 3000, host: "127.0.0.1", port: 8790,
+      defaultNotifications: "mentions", migrateLegacyAllToMentions: false, batchMs: 2000, pollMs: 3000, host: "127.0.0.1", port: 8790,
     });
   });
 
@@ -29,6 +29,11 @@ describe("loadConfig", () => {
     const c = loadConfig({ ROCKETR_ENV_FILE: file(base + "ROCKETR_PORT=1\n"), ROCKETR_PORT: "9000", ROCKETR_DEFAULT_NOTIFICATIONS: "mentions" });
     expect(c.port).toBe(9000);
     expect(c.defaultNotifications).toBe("mentions");
+  });
+
+  test("accepts an explicit one-shot legacy notification migration", () => {
+    expect(loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS: "true" }).migrateLegacyAllToMentions).toBe(true);
+    expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS: "yes" })).toThrow("ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS");
   });
 
   test("rejects an unknown notification level", () => {
