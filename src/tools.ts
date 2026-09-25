@@ -7,6 +7,7 @@ import type { Activity } from "./activity.js";
 const tool = <S extends z.ZodRawShape>(def: ToolDef<S>): ToolDef<any> => def as ToolDef<any>;
 
 const ROOM = z.string().min(1).describe('Room: an id (e.g. the room_id from a <channel source="rocketr"> tag), "#channel", or "@username" for a DM');
+const USERNAME = z.string().min(1).describe("Username, without the @");
 
 export const view = (m: Message) => ({
   id: m._id,
@@ -93,6 +94,30 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
         const r = await resolveRoom(rc, room);
         await rc.saveNotification(r._id, level);
         return { room_id: r._id, level };
+      },
+    }),
+    add_member: tool({
+      description:
+        "Add a user to a channel or private group. This account must already be a member of a private group to " +
+        "add someone else to it (Rocket.Chat's own rule) — it fails with error-not-allowed otherwise.",
+      input: { room: ROOM, username: USERNAME },
+      handler: async ({ room, username }, c) => {
+        const { rc } = accountOf(c);
+        const r = await resolveRoom(rc, room);
+        const u = await rc.userByUsername(username);
+        await rc.addMember(r, u._id);
+        return { room_id: r._id, username, added: true };
+      },
+    }),
+    remove_member: tool({
+      description: "Remove a user from a channel or private group.",
+      input: { room: ROOM, username: USERNAME },
+      handler: async ({ room, username }, c) => {
+        const { rc } = accountOf(c);
+        const r = await resolveRoom(rc, room);
+        const u = await rc.userByUsername(username);
+        await rc.removeMember(r, u._id);
+        return { room_id: r._id, username, removed: true };
       },
     }),
   };
