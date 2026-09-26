@@ -6,7 +6,10 @@ export class FakeRocketChat {
   readonly lead: User = { _id: "bot2", username: "lead", name: "Lead" };
   readonly users: User[] = [this.bot, this.lead, { _id: "u-boss", username: "boss" }, { _id: "u-rando", username: "rando" }];
   readonly tokens = new Map([["bot1", "tok"], ["bot2", "tok2"]]);
-  readonly rooms: Room[] = [{ _id: "GENERAL", t: "c", name: "general" }, { _id: "dm-boss", t: "d" }, { _id: "dm-boss-lead", t: "d" }, { _id: "dm-agents", t: "d" }];
+  readonly rooms: Room[] = [
+    { _id: "GENERAL", t: "c", name: "general" }, { _id: "dm-boss", t: "d" }, { _id: "dm-boss-lead", t: "d" }, { _id: "dm-agents", t: "d" },
+    { _id: "PRIVATE", t: "p", name: "leadership" },
+  ];
   /** Each bot's DM room with a given user. */
   private readonly dms: Record<string, Record<string, string>> = { bot1: { boss: "dm-boss", lead: "dm-agents" }, bot2: { boss: "dm-boss-lead", claude: "dm-agents" } };
   readonly subs = new Map<string, Subscription[]>();
@@ -15,6 +18,10 @@ export class FakeRocketChat {
   readonly reactions: Array<{ uid: string; messageId: string; emoji: string; shouldReact: boolean }> = [];
   readonly reads: string[] = [];
   readonly saved: Array<{ uid: string; rid: string; desktopNotifications?: string; mobilePushNotifications?: string }> = [];
+  /** Members of each private group ("p" room), so groups.invite can enforce "caller must already be in it". */
+  readonly groupMembers = new Map<string, Set<string>>();
+  readonly invited: Array<{ rid: string; userId: string }> = [];
+  readonly kicked: Array<{ rid: string; userId: string }> = [];
   private n = 0;
   server!: ReturnType<typeof Bun.serve>;
 
@@ -23,6 +30,7 @@ export class FakeRocketChat {
     const sub = (rid: string, name: string, t: Subscription["t"]): Subscription => ({ rid, name, t, unread: 0, userMentions: 0, _updatedAt: at });
     this.subs.set("bot1", [sub("GENERAL", "general", "c"), sub("dm-boss", "boss", "d"), sub("dm-agents", "lead", "d")]);
     this.subs.set("bot2", [sub("GENERAL", "general", "c"), sub("dm-boss-lead", "boss", "d"), sub("dm-agents", "claude", "d")]);
+    this.groupMembers.set("PRIVATE", new Set(["bot1"])); // claude is in; lead is not
   }
 
   get url() { return `http://127.0.0.1:${this.server.port}`; }
@@ -71,6 +79,23 @@ export class FakeRocketChat {
       }
       case "chat.react": this.reactions.push({ uid, ...body }); return json({ success: true });
       case "subscriptions.read": this.reads.push(body.rid); return json({ success: true });
+      case "channels.invite": this.invited.push({ rid: body.roomId, userId: body.userId }); return json({ success: true });
+      case "channels.kick": this.kicked.push({ rid: body.roomId, userId: body.userId }); return json({ success: true });
+      case "groups.invite": {
+        const members = this.groupMembers.get(body.roomId) ?? new Set();
+        if (!members.has(uid)) return json({ success: false, error: "error-not-allowed", errorType: "error-not-allowed" }, 403);
+        members.add(body.userId);
+        this.groupMembers.set(body.roomId, members);
+        this.invited.push({ rid: body.roomId, userId: body.userId });
+        return json({ success: true });
+      }
+      case "groups.kick": {
+        const members = this.groupMembers.get(body.roomId) ?? new Set();
+        if (!members.has(uid)) return json({ success: false, error: "error-not-allowed", errorType: "error-not-allowed" }, 403);
+        members.delete(body.userId);
+        this.kicked.push({ rid: body.roomId, userId: body.userId });
+        return json({ success: true });
+      }
       case "subscriptions.getOne": { const s = this.subs.get(uid)?.find((x) => x.rid === q("roomId")); return json({ success: true, subscription: s ?? null }); }
       case "rooms.saveNotification": {
         const s = this.subs.get(uid)?.find((x) => x.rid === body.roomId);

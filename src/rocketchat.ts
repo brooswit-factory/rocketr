@@ -52,6 +52,9 @@ export class RocketChatError extends Error {
 }
 
 const HISTORY: Record<RoomType, string> = { c: "channels.history", p: "groups.history", d: "im.history", l: "livechat/messages.history" };
+/** Only channels and private groups have a membership list to add/remove someone from. */
+const INVITE: Partial<Record<RoomType, string>> = { c: "channels.invite", p: "groups.invite" };
+const KICK: Partial<Record<RoomType, string>> = { c: "channels.kick", p: "groups.kick" };
 
 export class RocketChat {
   private readonly fetch: typeof fetch;
@@ -139,4 +142,16 @@ export class RocketChat {
   }
 
   async markRead(rid: string) { await this.call("subscriptions.read", { body: { rid } }); }
+
+  async addMember(room: Room, userId: string) {
+    const path = INVITE[room.t];
+    if (!path) throw new Error(`cannot add a member to a "${room.t}" room`);
+    await this.call(path, { body: { roomId: room._id, userId } });
+  }
+
+  async removeMember(room: Room, userId: string) {
+    const path = KICK[room.t];
+    if (!path) throw new Error(`cannot remove a member from a "${room.t}" room`);
+    await this.call(path, { body: { roomId: room._id, userId } });
+  }
 }

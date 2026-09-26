@@ -10,6 +10,7 @@ const THREAD_GUIDANCE = "Reply in the originating room and topic thread: use the
 const REACTION_GUIDANCE = "Acknowledge each message you read from the operator or collaborating agents promptly with eyes on that message_id (for a batch, each ID in message_ids). Receipt does not imply authorization or completion. For authorized work, add wrench to the original request when starting and send a concise threaded update. Add white_check_mark to the original request only when all requested work is complete, with a concise threaded completion reply. Remove white_check_mark with add=false if work reopens. A reaction alone is sufficient when no reply is needed; avoid duplicate acknowledgements and agent reply loops. ";
 
 const ROOM = z.string().min(1).describe('Room: an id (e.g. the room_id from a <channel source="rocketr"> tag), "#channel", or "@username" for a DM');
+const USERNAME = z.string().min(1).describe("Username, without the @");
 
 export const view = (m: Message) => ({
   id: m._id,
@@ -138,6 +139,30 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
         await rc.saveNotification(r._id, level);
         onNotificationChange?.(self.username, r._id, level);
         return { room_id: r._id, level };
+      },
+    }),
+    add_member: tool({
+      description:
+        "Add a user to a channel or private group. This account must already be a member of a private group to " +
+        "add someone else to it (Rocket.Chat's own rule) — it fails with error-not-allowed otherwise.",
+      input: { room: ROOM, username: USERNAME },
+      handler: async ({ room, username }, c) => {
+        const { rc } = accountOf(c);
+        const r = await resolveRoom(rc, room);
+        const u = await rc.userByUsername(username);
+        await rc.addMember(r, u._id);
+        return { room_id: r._id, username, added: true };
+      },
+    }),
+    remove_member: tool({
+      description: "Remove a user from a channel or private group.",
+      input: { room: ROOM, username: USERNAME },
+      handler: async ({ room, username }, c) => {
+        const { rc } = accountOf(c);
+        const r = await resolveRoom(rc, room);
+        const u = await rc.userByUsername(username);
+        await rc.removeMember(r, u._id);
+        return { room_id: r._id, username, removed: true };
       },
     }),
   };

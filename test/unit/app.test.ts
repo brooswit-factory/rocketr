@@ -37,7 +37,7 @@ describe("tools", () => {
   test("lists the tools", async () => {
     const c = await connect();
     expect((await c.listTools()).map((t) => t.name).sort())
-      .toEqual(["get_notifications", "list_rooms", "react_to_message", "read_messages", "send_image", "send_message", "set_notifications", "whoami"]);
+      .toEqual(["add_member", "get_notifications", "list_rooms", "react_to_message", "read_messages", "remove_member", "send_image", "send_message", "set_notifications", "whoami"]);
   });
 
   test("get_notifications and set_notifications read and write the room's own preference", async () => {
@@ -87,6 +87,36 @@ describe("tools", () => {
     const c = await connect();
     await expect(c.callTool("read_messages", { room: "#nowhere" })).rejects.toThrow("rooms.info: not found");
     expect(r.activity.snapshot().events.find((e) => e.type === "tool")).toMatchObject({ tool: "read_messages", ok: false });
+  });
+
+  test("add_member and remove_member invite/kick by username, resolving room and type", async () => {
+    const c = await connect();
+    expect(await c.callTool("add_member", { room: "#general", username: "rando" })).toEqual({ room_id: "GENERAL", username: "rando", added: true });
+    expect(rcServer.invited).toEqual([{ rid: "GENERAL", userId: "u-rando" }]);
+    expect(await c.callTool("remove_member", { room: "GENERAL", username: "rando" })).toEqual({ room_id: "GENERAL", username: "rando", removed: true });
+    expect(rcServer.kicked).toEqual([{ rid: "GENERAL", userId: "u-rando" }]);
+  });
+
+  test("add_member on a private group the caller belongs to succeeds", async () => {
+    const c = await connect(); // claude is a member of PRIVATE
+    expect(await c.callTool("add_member", { room: "PRIVATE", username: "rando" })).toMatchObject({ added: true });
+    expect(rcServer.invited).toContainEqual({ rid: "PRIVATE", userId: "u-rando" });
+  });
+
+  test("add_member on a private group the caller does NOT belong to fails with the room's own not-allowed error", async () => {
+    const c = await connect(LEAD); // lead is not a member of PRIVATE
+    await expect(c.callTool("add_member", { room: "PRIVATE", username: "rando" })).rejects.toThrow("error-not-allowed");
+  });
+
+  test("add_member and remove_member refuse a DM, which has no membership list to change", async () => {
+    const c = await connect();
+    await expect(c.callTool("add_member", { room: "@boss", username: "rando" })).rejects.toThrow('cannot add a member to a "d" room');
+    await expect(c.callTool("remove_member", { room: "@boss", username: "rando" })).rejects.toThrow('cannot remove a member from a "d" room');
+  });
+
+  test("add_member on an unknown username fails clearly", async () => {
+    const c = await connect();
+    await expect(c.callTool("add_member", { room: "#general", username: "ghost" })).rejects.toThrow("User not found");
   });
 });
 

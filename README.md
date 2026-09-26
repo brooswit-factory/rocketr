@@ -33,8 +33,13 @@ rocketr refuses to start if a token signs in as a different username than its na
 | `send_message` | Post to a room, DM, or thread. The reply tool for channel events |
 | `get_notifications` | The account's notification level for a room (what gets pushed from it) |
 | `set_notifications` | Set that level: `all`, `mentions` or `nothing` |
+| `add_member` | Add a user to a channel or private group |
+| `remove_member` | Remove a user from a channel or private group |
 
-A room is an id, `#channel`, or `@username` (a DM, created on first use).
+A room is an id, `#channel`, or `@username` (a DM, created on first use). `add_member`/`remove_member`
+only make sense for a channel or private group — a DM has no membership list to change. Rocket.Chat's
+own rule for a private group still applies: this account must already be a member of it to add or
+remove anyone else there, or the call fails with `error-not-allowed`.
 
 ## The channel
 
