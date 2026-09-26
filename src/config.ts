@@ -15,6 +15,11 @@ export interface Config {
   /** Every account rocketr signs in as. There is no default: a connection must name one. */
   accounts: AccountConfig[];
   /**
+   * Opt-in, single-account bridges only (`ROCKETR_DEFAULT_ACCOUNT`): a connection that sends no
+   * `x-rocketr-account` acts as this account. For clients that cannot set headers (e.g. Codex under Butchr).
+   */
+  defaultAccount?: string;
+  /**
    * Level saved on each account's rooms that have no preference yet (at startup and when the account joins one),
    * and assumed for a room until that save lands. Each room's own Rocket.Chat preference then decides what is pushed.
    */
@@ -65,6 +70,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     return { name, userId, token };
   });
 
+  const defaultAccount = get("ROCKETR_DEFAULT_ACCOUNT").replace(/^@/, "") || undefined;
+  if (defaultAccount && (names.length !== 1 || names[0] !== defaultAccount)) {
+    throw new Error(`rocketr: ROCKETR_DEFAULT_ACCOUNT needs exactly one account in ROCKETR_ACCOUNTS, and it must be that one (got "${defaultAccount}" for ${names.join(", ")})`);
+  }
+
   const int = (k: string, d: number) => {
     const v = get(k);
     if (!v) return d;
@@ -88,7 +98,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
 
   return {
-    url, accounts,
+    url, accounts, ...(defaultAccount ? { defaultAccount } : {}),
     defaultNotifications: level as NotifyLevel,
     migrateLegacyAllToMentions: bool("ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS"),
     batchMs: int("ROCKETR_BATCH_MS", 2000),

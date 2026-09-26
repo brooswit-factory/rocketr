@@ -12,6 +12,7 @@ export class FakeRocketChat {
   readonly subs = new Map<string, Subscription[]>();
   readonly messages: Message[] = [];
   readonly sent: Array<{ rid: string; msg: string; tmid?: string }> = [];
+  readonly reactions: Array<{ uid: string; messageId: string; emoji: string; shouldReact: boolean }> = [];
   readonly reads: string[] = [];
   readonly saved: Array<{ uid: string; rid: string; desktopNotifications?: string; mobilePushNotifications?: string }> = [];
   private n = 0;
@@ -68,6 +69,7 @@ export class FakeRocketChat {
         this.messages.push(m);
         return json({ success: true, message: m });
       }
+      case "chat.react": this.reactions.push({ uid, ...body }); return json({ success: true });
       case "subscriptions.read": this.reads.push(body.rid); return json({ success: true });
       case "subscriptions.getOne": { const s = this.subs.get(uid)?.find((x) => x.rid === q("roomId")); return json({ success: true, subscription: s ?? null }); }
       case "rooms.saveNotification": {

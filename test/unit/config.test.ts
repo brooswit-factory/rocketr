@@ -53,6 +53,17 @@ describe("loadConfig", () => {
       .toThrow("account rocketr-lead: missing ROCKETR_ACCOUNT_ROCKETR_LEAD_USER_ID, ROCKETR_ACCOUNT_ROCKETR_LEAD_TOKEN");
   });
 
+  test("ROCKETR_DEFAULT_ACCOUNT opts a single-account bridge into serving headerless clients", () => {
+    const one = "ROCKETR_URL=https://x\nROCKETR_ACCOUNTS=dev-zippy\nROCKETR_ACCOUNT_DEV_ZIPPY_USER_ID=u\nROCKETR_ACCOUNT_DEV_ZIPPY_TOKEN=t\n";
+    expect(loadConfig({ ROCKETR_ENV_FILE: file(one) }).defaultAccount).toBeUndefined();
+    expect(loadConfig({ ROCKETR_ENV_FILE: file(one), ROCKETR_DEFAULT_ACCOUNT: "@dev-zippy" }).defaultAccount).toBe("dev-zippy");
+    expect(() => loadConfig({ ROCKETR_ENV_FILE: file(one), ROCKETR_DEFAULT_ACCOUNT: "other" })).toThrow("ROCKETR_DEFAULT_ACCOUNT");
+  });
+
+  test("ROCKETR_DEFAULT_ACCOUNT is refused on a multi-account bridge", () => {
+    expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_DEFAULT_ACCOUNT: "claude" })).toThrow("exactly one account");
+  });
+
   test("rejects a non-integer number", () => {
     expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_POLL_MS: "soon" })).toThrow("ROCKETR_POLL_MS");
   });

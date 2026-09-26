@@ -6,6 +6,9 @@ import type { Activity } from "./activity.js";
 /** Infers handler args from the zod shape, then erases to the registry's type. */
 const tool = <S extends z.ZodRawShape>(def: ToolDef<S>): ToolDef<any> => def as ToolDef<any>;
 
+const THREAD_GUIDANCE = "Reply in the originating room and topic thread: use the event's thread_id when present, otherwise its message_id as thread_id to start a thread. Keep progress and completion replies in that thread; use a new top-level message only for a new topic or when requested. ";
+const REACTION_GUIDANCE = "Acknowledge each message you read from the operator or collaborating agents promptly with eyes on that message_id (for a batch, each ID in message_ids). Receipt does not imply authorization or completion. For authorized work, add wrench to the original request when starting and send a concise threaded update. Add white_check_mark to the original request only when all requested work is complete, with a concise threaded completion reply. Remove white_check_mark with add=false if work reopens. A reaction alone is sufficient when no reply is needed; avoid duplicate acknowledgements and agent reply loops. ";
+
 const ROOM = z.string().min(1).describe('Room: an id (e.g. the room_id from a <channel source="rocketr"> tag), "#channel", or "@username" for a DM');
 
 export const view = (m: Message) => ({
@@ -45,7 +48,7 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
       })),
     }),
     read_messages: tool({
-      description: "Recent messages in a room (oldest first), or in one thread when thread_id is given.",
+      description: "Recent messages in a room (oldest first), or in one thread when thread_id is given. " + REACTION_GUIDANCE,
       input: {
         room: ROOM,
         count: z.number().int().min(1).max(100).optional().describe("How many, default 20"),
@@ -58,19 +61,58 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
         return msgs.map(view).reverse().sort((a, b) => a.ts.localeCompare(b.ts));
       },
     }),
+    react_to_message: tool({
+      description: "Add or remove your account's emoji reaction to a message. Use the channel event's message_id (not its thread_id) to acknowledge that message. Repeated adds keep the reaction present. " + REACTION_GUIDANCE,
+      input: {
+        message_id: z.string().min(1).describe("Message to react to"),
+        emoji: z.string().min(1).describe("Rocket.Chat emoji name, e.g. eyes or white_check_mark"),
+        add: z.boolean().optional().describe("Default true; false removes your reaction"),
+      },
+      handler: async ({ message_id, emoji, add = true }, c) => {
+        await accountOf(c).rc.react(message_id, emoji, add);
+        return { message_id, emoji, added: add };
+      },
+    }),
     send_message: tool({
       description:
         'Post a message to Rocket.Chat. This is the reply tool for <channel source="rocketr"> events: pass the tag\'s room_id as room, ' +
-        "and its thread_id (if present) to answer inside that thread. Markdown is supported.",
+        "and use threaded replies. Markdown is supported. " + THREAD_GUIDANCE + REACTION_GUIDANCE,
       input: {
         room: ROOM,
         text: z.string().min(1).describe("Message text"),
-        thread_id: z.string().optional().describe("Reply inside this thread"),
+        thread_id: z.string().optional().describe("Topic thread root: event.thread_id, or event.message_id for a new reply thread"),
       },
       handler: async ({ room, text, thread_id }, c) => {
         const { rc } = accountOf(c);
         const r = await resolveRoom(rc, room);
         const m = await rc.send(r._id, text, thread_id);
+        return { sent: true, message_id: m._id, room_id: r._id };
+      },
+    }),
+    send_image: tool({
+      description: "Upload and post a PNG, JPEG, GIF or WebP image to Rocket.Chat, optionally with a caption or in a thread. Supply base64 file bytes from the caller's machine (not a local path or data URL). Maximum decoded size: 10 MiB. " + THREAD_GUIDANCE,
+      input: {
+        room: ROOM,
+        data_base64: z.string().min(4).max(13981016).describe("Base64-encoded image file bytes"),
+        filename: z.string().min(1).max(255).regex(/^[^/\\\x00-\x1f]+$/).describe("Image filename, e.g. screenshot.png"),
+        mime_type: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]),
+        text: z.string().optional().describe("Optional caption"),
+        thread_id: z.string().optional().describe("Topic thread root: event.thread_id, or event.message_id for a new reply thread"),
+      },
+      handler: async ({ room, data_base64, filename, mime_type, text, thread_id }, c) => {
+        if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data_base64)) throw new Error("Invalid base64 image data");
+        const bytes = Buffer.from(data_base64, "base64");
+        if (!bytes.length || bytes.length > 10 * 1024 * 1024) throw new Error("Image must be between 1 byte and 10 MiB");
+        const signatures: Record<string, boolean> = {
+          "image/png": bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])),
+          "image/jpeg": bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255,
+          "image/gif": ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString()),
+          "image/webp": bytes.subarray(0, 4).toString() === "RIFF" && bytes.subarray(8, 12).toString() === "WEBP",
+        };
+        if (!signatures[mime_type]) throw new Error("Image signature does not match mime_type");
+        const { rc } = accountOf(c);
+        const r = await resolveRoom(rc, room);
+        const m = await rc.sendImage(r._id, bytes, filename, mime_type, text, thread_id);
         return { sent: true, message_id: m._id, room_id: r._id };
       },
     }),
@@ -107,12 +149,13 @@ export function instrument(tools: Record<string, ToolDef<any>>, activity: Activi
     ...def,
     handler: async (args: unknown, c: Connection) => {
       const t0 = performance.now();
+      const loggedArgs = name === "send_image" ? { ...(args as Record<string, unknown>), data_base64: "[omitted]" } : args;
       try {
         const out = await def.handler(args as never, c);
-        activity.toolCall(c.id, name, args, true, out, Math.round(performance.now() - t0));
+        activity.toolCall(c.id, name, loggedArgs, true, out, Math.round(performance.now() - t0));
         return out;
       } catch (err) {
-        activity.toolCall(c.id, name, args, false, (err as Error).message, Math.round(performance.now() - t0));
+        activity.toolCall(c.id, name, loggedArgs, false, (err as Error).message, Math.round(performance.now() - t0));
         throw err;
       }
     },

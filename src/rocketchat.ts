@@ -59,13 +59,13 @@ export class RocketChat {
     this.fetch = o.fetch ?? fetch;
   }
 
-  private async call<T>(path: string, init: { query?: Record<string, string | number | undefined>; body?: unknown } = {}): Promise<T> {
+  private async call<T>(path: string, init: { query?: Record<string, string | number | undefined>; body?: unknown; form?: FormData } = {}): Promise<T> {
     const url = new URL(`${this.o.url}/api/v1/${path}`);
     for (const [k, v] of Object.entries(init.query ?? {})) if (v !== undefined) url.searchParams.set(k, String(v));
     const res = await this.fetch(url, {
-      method: init.body === undefined ? "GET" : "POST",
-      headers: { "X-User-Id": this.o.userId, "X-Auth-Token": this.o.token, "Content-Type": "application/json" },
-      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      method: init.body === undefined && !init.form ? "GET" : "POST",
+      headers: { "X-User-Id": this.o.userId, "X-Auth-Token": this.o.token, ...(!init.form ? { "Content-Type": "application/json" } : {}) },
+      ...(init.form ? { body: init.form } : init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
     });
     const data = (await res.json().catch(() => ({}))) as { success?: boolean; error?: string; message?: string };
     if (!res.ok || data.success === false) throw new RocketChatError(res.status, path, data.error ?? data.message ?? res.statusText);
@@ -119,6 +119,23 @@ export class RocketChat {
   async send(rid: string, text: string, tmid?: string) {
     const message = { rid, msg: text, ...(tmid ? { tmid } : {}) };
     return (await this.call<{ message: Message }>("chat.sendMessage", { body: { message } })).message;
+  }
+
+  /** Upload first, then publish once using the same account and room. */
+  async sendImage(rid: string, bytes: Uint8Array, filename: string, mime: string, text?: string, tmid?: string) {
+    const form = new FormData();
+    form.set("file", new Blob([new Uint8Array(bytes)], { type: mime }), filename);
+    const room = encodeURIComponent(rid);
+    const { file } = await this.call<{ file: { _id: string } }>(`rooms.media/${room}`, { form });
+    if (!file?._id) throw new Error("Image upload returned no file ID");
+    const { message } = await this.call<{ message: Message }>(`rooms.mediaConfirm/${room}/${encodeURIComponent(file._id)}`, {
+      body: { ...(text ? { msg: text } : {}), ...(tmid ? { tmid } : {}) },
+    });
+    return message;
+  }
+
+  async react(messageId: string, emoji: string, shouldReact = true) {
+    await this.call("chat.react", { body: { messageId, emoji, shouldReact } });
   }
 
   async markRead(rid: string) { await this.call("subscriptions.read", { body: { rid } }); }
