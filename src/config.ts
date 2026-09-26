@@ -15,10 +15,17 @@ export interface Config {
   /** Every account rocketr signs in as. There is no default: a connection must name one. */
   accounts: AccountConfig[];
   /**
+   * Opt-in, single-account bridges only (`ROCKETR_DEFAULT_ACCOUNT`): a connection that sends no
+   * `x-rocketr-account` acts as this account. For clients that cannot set headers (e.g. Codex under Butchr).
+   */
+  defaultAccount?: string;
+  /**
    * Level saved on each account's rooms that have no preference yet (at startup and when the account joins one),
    * and assumed for a room until that save lands. Each room's own Rocket.Chat preference then decides what is pushed.
    */
   defaultNotifications: NotifyLevel;
+  /** One-shot recovery switch: replace legacy broad room preferences with mention-only delivery. */
+  migrateLegacyAllToMentions: boolean;
   /** Messages in one room and thread arriving within this many ms of each other become one turn. 0 = no batching. */
   batchMs: number;
   pollMs: number;
@@ -63,6 +70,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     return { name, userId, token };
   });
 
+  const defaultAccount = get("ROCKETR_DEFAULT_ACCOUNT").replace(/^@/, "") || undefined;
+  if (defaultAccount && (names.length !== 1 || names[0] !== defaultAccount)) {
+    throw new Error(`rocketr: ROCKETR_DEFAULT_ACCOUNT needs exactly one account in ROCKETR_ACCOUNTS, and it must be that one (got "${defaultAccount}" for ${names.join(", ")})`);
+  }
+
   const int = (k: string, d: number) => {
     const v = get(k);
     if (!v) return d;
@@ -70,15 +82,25 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     if (!Number.isInteger(n) || n < 0) throw new Error(`rocketr: ${k} must be a non-negative integer, got "${v}"`);
     return n;
   };
+  const bool = (k: string) => {
+    const v = get(k);
+    if (!v) return false;
+    if (v === "1" || v === "true") return true;
+    if (v === "0" || v === "false") return false;
+    throw new Error(`rocketr: ${k} must be true or false, got "${v}"`);
+  };
 
-  const level = get("ROCKETR_DEFAULT_NOTIFICATIONS") || "all";
+  // Public rooms are noisy by default. Agents still receive DMs, @mentions, and
+  // replies in followed threads, while a deliberate room setting can opt into all.
+  const level = get("ROCKETR_DEFAULT_NOTIFICATIONS") || "mentions";
   if (!(NOTIFY_LEVELS as readonly string[]).includes(level)) {
     throw new Error(`rocketr: ROCKETR_DEFAULT_NOTIFICATIONS must be one of ${NOTIFY_LEVELS.join(", ")}, got "${level}"`);
   }
 
   return {
-    url, accounts,
+    url, accounts, ...(defaultAccount ? { defaultAccount } : {}),
     defaultNotifications: level as NotifyLevel,
+    migrateLegacyAllToMentions: bool("ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS"),
     batchMs: int("ROCKETR_BATCH_MS", 2000),
     pollMs: int("ROCKETR_POLL_MS", 3000),
     host: get("ROCKETR_HOST") || "127.0.0.1",

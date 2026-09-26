@@ -55,7 +55,7 @@ notification preference for that room** says to notify about, from any sender:
 
 The level is the room's desktop notification preference — the same one a person sets under a room's
 "Notification Preferences" — and agents change it with `set_notifications`. Rooms that never had one saved get
-`ROCKETR_DEFAULT_NOTIFICATIONS` (`all`), at startup and when the account joins them; a room someone reset to
+`ROCKETR_DEFAULT_NOTIFICATIONS` (`mentions`), at startup and when the account joins them; a room someone reset to
 "default" is left alone and treated as that level. The account's own messages, system messages and users it
 ignores are never pushed.
 
@@ -139,7 +139,8 @@ tools as the bot, so don't expose it.
 | `ROCKETR_URL` | `ROCKETCHAT_URL` | Rocket.Chat base URL |
 | `ROCKETR_ACCOUNTS` | — | Comma-separated usernames rocketr signs in as (required) |
 | `ROCKETR_ACCOUNT_<NAME>_USER_ID`, `_TOKEN` | — | Each account's personal access token |
-| `ROCKETR_DEFAULT_NOTIFICATIONS` | `all` | Level saved on rooms with no notification preference yet |
+| `ROCKETR_DEFAULT_NOTIFICATIONS` | `mentions` | Level saved on rooms with no notification preference yet |
+| `ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS` | `false` | One startup only: convert saved `all` preferences to `mentions`; reversible per room |
 | `ROCKETR_BATCH_MS` | `2000` | Burst window per room and thread; `0` pushes every message on its own |
 | `ROCKETR_POLL_MS` | `3000` | Poll interval; backs off to 60s while Rocket.Chat is unreachable |
 | `ROCKETR_HOST` / `ROCKETR_PORT` | `127.0.0.1` / `8790` | Listen address |
@@ -162,3 +163,42 @@ and the web app are all exercised over HTTP.
   for telling Claude how to reply. rocketr puts that guidance in `send_message`'s
   description instead.
 - Polling, not Rocket.Chat's realtime API: a push lands within one poll interval.
+
+### Posting screenshots
+
+Use `send_image` with `room`, `filename`, `mime_type`, and `data_base64` (base64
+file bytes, without a data URL prefix). Optional `text` adds a caption and
+`thread_id` posts in a thread. PNG, JPEG, GIF and WebP are supported up to 10 MiB;
+the Rocket.Chat server may impose a lower limit. Image bytes travel from the
+caller, so the bridge does not need access to Zippy's screenshot paths. Image
+payloads are omitted from the activity log.
+
+The bridge uses Rocket.Chat's [media upload API](https://developer.rocket.chat/apidocs/upload-media-files-to-a-room)
+and [media confirmation API](https://developer.rocket.chat/apidocs/check-uploaded-file).
+Both endpoints must be available on the server. Upload and publication errors
+are returned without automatic retries, to avoid duplicate posts.
+
+### Agent online status
+
+An account appears online in Rocket.Chat while at least one MCP session for that
+account has `x-rocketr-channel: on`. Tools-only sessions do not mark an agent
+online. Multiple channel sessions share one presence connection; closing the last
+one closes it. This indicates a connected agent runtime, not whether a model is
+currently working or its provider is available.
+
+The bridge uses Rocket.Chat's [authenticated realtime connection](https://developer.rocket.chat/apidocs/login-realtime)
+and `UserPresence:online`, answering server pings and sending a heartbeat every
+30 seconds. Presence reconnects after network failures. Closing the bridge's
+socket lets Rocket.Chat clear presence after its normal disconnect timeout,
+including when the bridge crashes. Abrupt MCP disconnects are detected by
+thatch's stale-session cleanup (normally up to 75 seconds after stream detach).
+No persistent manual status is set and the shared account token is never logged
+out or revoked. Dedicated agent accounts should use the normal Online default;
+a manually selected Invisible status can override automatic presence.
+
+### Message reactions
+
+`react_to_message` accepts `message_id`, `emoji` (for example `eyes`), and optional
+`add` (defaults to true; false removes your reaction). It uses the calling
+account and [chat.react](https://developer.rocket.chat/apidocs/react-to-message)
+with an explicit add/remove flag, so repeating an acknowledgement does not toggle it off.

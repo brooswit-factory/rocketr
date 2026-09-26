@@ -6,6 +6,7 @@ import { FakeRocketChat } from "./fake-rocketchat.js";
 
 let rcServer: FakeRocketChat, r: Rocketr, base: string;
 const conns: FakeConnection[] = [];
+const presenceStates = new Map<string, boolean>();
 const ON = { "x-rocketr-channel": "on" };
 const CLAUDE = { "x-rocketr-account": "claude" };
 const LEAD = { "x-rocketr-account": "lead" };
@@ -15,10 +16,14 @@ const connect = async (headers: Record<string, string> = {}) => { const c = awai
 beforeEach(async () => {
   rcServer = new FakeRocketChat().start();
   const cfg: Config = {
-    url: rcServer.url, defaultNotifications: "all", batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+    url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
     accounts: [{ name: "claude", userId: "bot1", token: "tok" }, { name: "lead", userId: "bot2", token: "tok2" }],
   };
-  r = await createRocketr(cfg);
+  presenceStates.clear();
+  r = await createRocketr(cfg, { presence: ({ userId }) => ({
+    setListening: (value) => { presenceStates.set(userId, value); },
+    stop: () => { presenceStates.set(userId, false); },
+  }) });
   base = `http://127.0.0.1:${(await r.listen()).port}`;
 });
 
@@ -32,7 +37,7 @@ describe("tools", () => {
   test("lists the tools", async () => {
     const c = await connect();
     expect((await c.listTools()).map((t) => t.name).sort())
-      .toEqual(["add_member", "get_notifications", "list_rooms", "read_messages", "remove_member", "send_message", "set_notifications", "whoami"]);
+      .toEqual(["add_member", "get_notifications", "list_rooms", "react_to_message", "read_messages", "remove_member", "send_image", "send_message", "set_notifications", "whoami"]);
   });
 
   test("get_notifications and set_notifications read and write the room's own preference", async () => {
@@ -55,6 +60,20 @@ describe("tools", () => {
     await c.callTool("send_message", { room: "#general", text: "hi all" });
     await c.callTool("send_message", { room: "GENERAL", text: "in thread", thread_id: "t1" });
     expect(rcServer.sent).toEqual([{ rid: "dm-boss", msg: "hi boss" }, { rid: "GENERAL", msg: "hi all" }, { rid: "GENERAL", msg: "in thread", tmid: "t1" }]);
+  });
+
+  test("reactions explicitly add or remove using the calling account", async () => {
+    const c = await connect();
+    const lead = await connect(LEAD);
+    await c.callTool("react_to_message", { message_id: "m1", emoji: "eyes" });
+    await c.callTool("react_to_message", { message_id: "m1", emoji: "eyes" });
+    await lead.callTool("react_to_message", { message_id: "m1", emoji: "eyes", add: false });
+    expect(rcServer.reactions).toEqual([
+      { uid: "bot1", messageId: "m1", emoji: "eyes", shouldReact: true },
+      { uid: "bot1", messageId: "m1", emoji: "eyes", shouldReact: true },
+      { uid: "bot2", messageId: "m1", emoji: "eyes", shouldReact: false },
+    ]);
+    await expect(c.callTool("react_to_message", { message_id: "", emoji: "eyes" })).rejects.toThrow();
   });
 
   test("read_messages returns oldest first", async () => {
@@ -101,6 +120,24 @@ describe("tools", () => {
   });
 });
 
+test("presence follows channel sessions per account and survives overlapping sessions", async () => {
+  await connect();
+  expect(presenceStates.get("bot1")).toBe(false);
+  const a = await connect(ON);
+  const b = await connect(ON);
+  const lead = await connect({ ...ON, ...LEAD });
+  expect(presenceStates.get("bot1")).toBe(true);
+  expect(presenceStates.get("bot2")).toBe(true);
+  await a.disconnect();
+  await Bun.sleep(20);
+  expect(presenceStates.get("bot1")).toBe(true);
+  await b.disconnect();
+  await Bun.sleep(20);
+  expect(presenceStates.get("bot1")).toBe(false);
+  expect(presenceStates.get("bot2")).toBe(true);
+  await lead.disconnect();
+});
+
 describe("channel", () => {
   test("a DM is pushed into the session and the room marked read", async () => {
     const c = await connect({ "x-agent-name": "main", ...ON });
@@ -135,6 +172,16 @@ describe("channel", () => {
     expect(f.meta.kind).toBe("mention");
   });
 
+  test("muting a room discards its already-queued frames for that account", async () => {
+    rcServer.post("dm-boss-lead", "boss", "hold this");
+    await Bun.sleep(100);
+    expect(r.pending.map((item) => item.account)).toEqual(["lead"]);
+
+    const c = await connect({ ...LEAD, ...ON });
+    await c.callTool("set_notifications", { room: "@boss", level: "nothing" });
+    expect(r.pending).toEqual([]);
+  });
+
   test("never its own messages, but other agents in the room hear them", async () => {
     await connect(ON);
     rcServer.post("GENERAL", "claude", "talking to myself");
@@ -150,6 +197,16 @@ describe("channel", () => {
     expect((await c.nextFrame(3000)).content).toBe("while you were out");
     await Bun.sleep(30);
     expect(r.pending.length).toBe(0);
+  });
+
+  test("a reconnect supersedes an older channel session for exactly-once delivery", async () => {
+    await connect(ON);
+    const current = await connect(ON);
+    await Bun.sleep(50);
+    rcServer.post("dm-boss", "boss", "one live turn only");
+    expect((await current.nextFrame(3000)).content).toBe("one live turn only");
+    await Bun.sleep(30);
+    expect(r.activity.snapshot().events.filter((event) => event.type === "push")).toHaveLength(1);
   });
 
   test("pushes are opt-in: a tools-only session never swallows a message", async () => {
@@ -179,6 +236,26 @@ describe("channel", () => {
 describe("accounts", () => {
   test("no fallback: a client that names no account is refused at connect", async () => {
     await expect(FakeConnection.connect(base, { headers: {} })).rejects.toThrow();
+  });
+
+  test("an opt-in default account serves a client that names none, and still refuses a wrong name", async () => {
+    const single = await createRocketr({
+      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      accounts: [{ name: "claude", userId: "bot1", token: "tok" }], defaultAccount: "claude",
+    }, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
+    const url = `http://127.0.0.1:${(await single.listen()).port}`;
+    try {
+      const c = await FakeConnection.connect(url, { headers: { ...ON } });
+      conns.push(c);
+      expect((await c.callTool("whoami")).username).toBe("claude");
+      await Bun.sleep(50); // let the notification stream attach
+      rcServer.post("dm-boss", "boss", "headerless?");
+      expect((await c.nextFrame(3000)).content).toBe("headerless?");
+      await expect(FakeConnection.connect(url, { headers: { "x-rocketr-account": "lead" } })).rejects.toThrow();
+    } finally {
+      for (const c of conns.splice(0)) await c.disconnect().catch(() => {});
+      await single.stop();
+    }
   });
 
   test("an unknown account is refused at connect", async () => {
@@ -226,7 +303,7 @@ describe("accounts", () => {
   });
 
   test("an account whose token signs in as someone else is rejected at startup", async () => {
-    const bad: Config = { url: rcServer.url, defaultNotifications: "all", batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
+    const bad: Config = { url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
     await expect(createRocketr(bad)).rejects.toThrow('account "claude" signs in as @lead');
   });
 });
@@ -246,6 +323,14 @@ describe("web app", () => {
     expect(s.agents[0]).toMatchObject({ name: "main", calls: 1, headers: { "x-rocketr-account": "claude" } });
     expect(s.accounts.map((a: any) => a.username)).toEqual(["claude", "lead"]);
     expect(JSON.stringify(s)).not.toContain("secret");
+  });
+
+  test("snapshot reports pending counts by account without message content", async () => {
+    rcServer.post("dm-boss-lead", "boss", "queued");
+    await Bun.sleep(100);
+    const s = await (await fetch(base + "/api/snapshot")).json() as any;
+    expect(s.pendingByAccount).toEqual({ lead: 1 });
+    expect(JSON.stringify(s.pendingByAccount)).not.toContain("queued");
   });
 
   test("the stream carries tool calls live", async () => {

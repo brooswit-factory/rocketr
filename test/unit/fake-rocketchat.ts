@@ -15,6 +15,7 @@ export class FakeRocketChat {
   readonly subs = new Map<string, Subscription[]>();
   readonly messages: Message[] = [];
   readonly sent: Array<{ rid: string; msg: string; tmid?: string }> = [];
+  readonly reactions: Array<{ uid: string; messageId: string; emoji: string; shouldReact: boolean }> = [];
   readonly reads: string[] = [];
   readonly saved: Array<{ uid: string; rid: string; desktopNotifications?: string; mobilePushNotifications?: string }> = [];
   /** Members of each private group ("p" room), so groups.invite can enforce "caller must already be in it". */
@@ -76,6 +77,7 @@ export class FakeRocketChat {
         this.messages.push(m);
         return json({ success: true, message: m });
       }
+      case "chat.react": this.reactions.push({ uid, ...body }); return json({ success: true });
       case "subscriptions.read": this.reads.push(body.rid); return json({ success: true });
       case "channels.invite": this.invited.push({ rid: body.roomId, userId: body.userId }); return json({ success: true });
       case "channels.kick": this.kicked.push({ rid: body.roomId, userId: body.userId }); return json({ success: true });

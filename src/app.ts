@@ -5,6 +5,7 @@ import { RocketChat, type Subscription, type User } from "./rocketchat.js";
 import { Batcher, Watcher, toFrame, type InboundEvent } from "./watcher.js";
 import { Activity } from "./activity.js";
 import { buildTools, instrument } from "./tools.js";
+import { Presence } from "./presence.js";
 import { page } from "./web.js";
 
 export const VERSION = "0.3.0";
@@ -44,12 +45,13 @@ export interface Rocketr {
   stop(): Promise<void>;
 }
 
-export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } = {}): Promise<Rocketr> {
+export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch; presence?: (options: ConstructorParameters<typeof Presence>[0]) => Pick<Presence, "setListening" | "stop"> } = {}): Promise<Rocketr> {
   const activity = new Activity();
   const log = (message: string) => { console.error(`rocketr: ${message}`); activity.record({ type: "log", message }); };
 
   const accounts = new Map<string, Account>();
   const pending: Pending[] = [];
+  const presences = new Map<string, Pick<Presence, "setListening" | "stop">>();
   let delivering = Promise.resolve(0);
 
   const clients: Array<{ rc: RocketChat; self: User }> = [];
@@ -59,6 +61,10 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
     // the header names the account by username, so a name that doesn't match its token would be a lie
     if (self.username !== a.name) throw new Error(`rocketr: account "${a.name}" signs in as @${self.username} — fix ROCKETR_ACCOUNTS or its token`);
     clients.push({ rc, self });
+    presences.set(self.username, (deps.presence ?? ((options) => new Presence(options)))({
+      url: cfg.url, userId: a.userId, token: a.token,
+      log: (message) => log(`@${self.username}: ${message}`),
+    }));
   }
 
   /**
@@ -66,11 +72,13 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
    * own UI. A room someone explicitly reset to "default" is left alone.
    */
   const adopt = async (rc: RocketChat, self: User, sub: Subscription) => {
-    if (sub.desktopNotifications || sub.disableNotifications !== undefined) return;
+    const migrate = cfg.migrateLegacyAllToMentions && sub.desktopNotifications === "all";
+    if (!migrate && (sub.desktopNotifications || sub.disableNotifications !== undefined)) return;
+    const level = migrate ? "mentions" : cfg.defaultNotifications;
     try {
-      await rc.saveNotification(sub.rid, cfg.defaultNotifications);
-      sub.desktopNotifications = cfg.defaultNotifications;
-      log(`@${self.username}: ${sub.fname || sub.name} notifications set to ${cfg.defaultNotifications}`);
+      await rc.saveNotification(sub.rid, level);
+      sub.desktopNotifications = level;
+      log(`@${self.username}: ${sub.fname || sub.name} notifications set to ${level}`);
     } catch (err) {
       log(`@${self.username}: cannot set notifications for ${sub.fname || sub.name}: ${(err as Error).message}`);
     }
@@ -80,41 +88,54 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
     catch (err) { log(`@${self.username}: cannot list rooms: ${(err as Error).message}`); }
   }
 
+  /** The account a connection named, or the bridge's opt-in default when it named none. */
+  const nameOf = (header: string | null | undefined) => header || cfg.defaultAccount || "";
   const accountOf = (c: Connection): Account => {
-    const a = accounts.get(c.headers[ACCOUNT_HEADER] ?? "");
+    const a = accounts.get(nameOf(c.headers[ACCOUNT_HEADER]));
     if (!a) throw new Error(`this session has no Rocket.Chat account (set the ${ACCOUNT_HEADER} header)`);
     return a;
   };
 
   const { plugin, mcp } = thatch({
     serverInfo: { name: "rocketr", version: VERSION },
-    // No fallback account: a client that doesn't name a known one is refused at connect.
-    auth: (req) => accounts.has(req.headers.get(ACCOUNT_HEADER) ?? ""),
-    tools: instrument(buildTools(accountOf, cfg.url, cfg.defaultNotifications), activity),
+    // No fallback account unless ROCKETR_DEFAULT_ACCOUNT opts a single-account bridge in: a client that
+    // doesn't name a known one is refused at connect.
+    auth: (req) => accounts.has(nameOf(req.headers.get(ACCOUNT_HEADER))),
+    tools: instrument(buildTools(accountOf, cfg.url, cfg.defaultNotifications, (account, roomId, level) => {
+      if (level !== "nothing") return;
+      for (const item of [...pending]) {
+        if (item.account === account && item.frame.meta.room_id === roomId) pending.splice(pending.indexOf(item), 1);
+      }
+    }), activity),
   });
-  mcp.on("connect", (c) => activity.connected(c));
-  mcp.on("disconnect", (c, reason) => activity.record({ type: "disconnect", agentId: c.id, reason }));
+  const syncPresence = (c: Connection) => {
+    const account = nameOf(c.headers[ACCOUNT_HEADER]);
+    presences.get(account)?.setListening(mcp.connections.filter((session) =>
+      nameOf(session.headers[ACCOUNT_HEADER]) === account && session.headers["x-rocketr-channel"] === "on").length > 0);
+  };
+  mcp.on("connect", (c) => { activity.connected(c); syncPresence(c); });
+  mcp.on("disconnect", (c, reason) => {
+    activity.record({ type: "disconnect", agentId: c.id, reason });
+    syncPresence(c);
+  });
 
   /**
    * Pushes are opt-in (`x-rocketr-channel: on`) and go only to sessions of the addressed account. Claude Code
    * accepts a frame on the wire even when the session wasn't started with the channel flag, then drops it
    * silently — so a tools-only session must never count as a delivery, or the message is marked read and lost.
    */
-  const listening = (account: string) =>
-    mcp.connections.filter((c) => c.headers["x-rocketr-channel"] === "on" && c.headers[ACCOUNT_HEADER] === account);
+  const listening = (account: string) => mcp.connections
+    .filter((c) => c.headers["x-rocketr-channel"] === "on" && nameOf(c.headers[ACCOUNT_HEADER]) === account)
+    .sort((a, b) => b.connectedAt - a.connectedAt)[0];
 
   const deliverOnce = async () => {
     let landed = 0;
     for (const item of [...pending]) {
-      const targets = listening(item.account);
-      if (!targets.length) continue;
-      let ok = false;
-      for (const c of targets) {
-        const d = await c.send(item.frame);
-        activity.record({ type: "push", agentId: c.id, messageId: item.frame.meta.message_id ?? "", delivery: d });
-        ok ||= d.claim === "C2";
-      }
-      if (!ok) continue;
+      const target = listening(item.account);
+      if (!target) continue;
+      const delivery = await target.send(item.frame);
+      activity.record({ type: "push", agentId: target.id, messageId: item.frame.meta.message_id ?? "", delivery });
+      if (delivery.claim !== "C2") continue;
       pending.splice(pending.indexOf(item), 1);
       landed++;
       const rid = item.frame.meta.room_id;
@@ -160,7 +181,15 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
     .get("/", () => new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } }))
     .get("/api/snapshot", () => ({
       accounts: [...accounts.values()].map((a) => ({ id: a.self._id, username: a.self.username })),
-      server: cfg.url, version: VERSION, pending: pending.length, ...activity.snapshot(),
+      server: cfg.url,
+      version: VERSION,
+      pending: pending.length,
+      // Counts only: enough to diagnose a stalled account without exposing message contents.
+      pendingByAccount: pending.reduce<Record<string, number>>((counts, item) => {
+        counts[item.account] = (counts[item.account] ?? 0) + 1;
+        return counts;
+      }, {}),
+      ...activity.snapshot(),
     }))
     .get("/api/stream", ({ request }) => {
       let off = () => {};
@@ -190,6 +219,7 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch } 
       if (retry) clearInterval(retry);
       await batcher.flushAll();
       await mcp.closeAll();
+      for (const presence of presences.values()) presence.stop();
       await app.stop(true); // close open observer streams too
     },
   };
