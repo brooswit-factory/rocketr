@@ -13,7 +13,7 @@ export const page = /* html */ `<!doctype html>
   * { box-sizing:border-box } body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif,system-ui,sans-serif }
   header { display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; padding:14px 20px; border-bottom:1px solid var(--line); background:var(--panel) }
   header h1 { margin:0; font-size:18px; letter-spacing:-.01em } header h1 b { color:var(--accent) }
-  .meta { color:var(--muted) } .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--err); margin-right:6px }
+  .meta { color:var(--muted) } .warn { color:var(--warn); font-weight:600 } .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--err); margin-right:6px }
   .dot.live { background:var(--push) }
   main { display:grid; grid-template-columns: 260px 1fr; min-height:calc(100vh - 54px) }
   @media (max-width: 760px) { main { grid-template-columns: 1fr } aside { border-right:0; border-bottom:1px solid var(--line) } }
@@ -39,6 +39,7 @@ export const page = /* html */ `<!doctype html>
 <header>
   <h1><b>rocket</b>r</h1>
   <span class="meta" id="who">connecting…</span>
+  <span class="warn" id="excluded"></span>
   <span class="meta" style="margin-left:auto"><span class="dot" id="dot"></span><span id="state">offline</span> · <span id="pending">0</span> queued</span>
 </header>
 <main>
@@ -113,6 +114,10 @@ function apply(e) {
 async function load() {
   const s = await (await fetch("api/snapshot")).json();
   $("who").textContent = s.accounts.map((a) => "@" + a.username).join(", ") + " on " + s.server.replace(/^https?:\\/\\//, "") + " · v" + s.version;
+  const excluded = s.excludedAccounts || [];
+  $("excluded").textContent = excluded.length
+    ? "⚠ " + excluded.length + " account(s) excluded at startup: " + excluded.map((f) => f.name + " (" + f.detail + ")").join("; ")
+    : "";
   $("pending").textContent = s.pending;
   agents = new Map(s.agents.map((a) => [a.id, a])); events = s.events;
   for (const e of events) { if (e.type === "connect") names.set(e.agent.id, e.agent.name); }
