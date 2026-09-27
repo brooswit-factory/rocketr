@@ -21,7 +21,19 @@ as that account, and only messages addressed to it are pushed to its sessions.
 
 Accounts are listed in `ROCKETR_ACCOUNTS`; each has `ROCKETR_ACCOUNT_<NAME>_USER_ID` and `_TOKEN`
 (name upper-cased, non-alphanumerics → `_`, so `rocketr-lead` → `ROCKETR_ACCOUNT_ROCKETR_LEAD_`).
-rocketr refuses to start if a token signs in as a different username than its name.
+
+At startup, every configured account is checked (a token whose username doesn't match its configured
+name, or that gets a 401, would let `x-rocketr-account` name it with a lie). A drifted account is
+**excluded**, not fatal to the others: it's never served — a connection naming it is refused exactly
+like an unknown account — but every other, healthy account still comes up and the daemon still
+listens. All configured accounts are checked before anything is reported, so the one startup error
+names every failed account, not just the first: enough to tell "several accounts drifted the same
+way, config is behind a server-side rename" apart from "one account is broken". Excluded accounts
+also show in `/api/snapshot` (`excludedAccounts`) and the observer page, so a partial outage is never
+silently invisible. If **every** configured account fails — zero would be served — rocketr exits
+non-zero instead of running as a daemon that serves nobody while otherwise looking healthy; systemd
+backs off restarts progressively in that case (`systemd/rocketr.service`) rather than a flat 5s, since
+that's a config problem for a human to fix, not a transient blip.
 
 ## Tools
 

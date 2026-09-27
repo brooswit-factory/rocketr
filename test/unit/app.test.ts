@@ -302,9 +302,87 @@ describe("accounts", () => {
     expect((await c.nextFrame(3000)).content).toBe("for claude, queued first");
   });
 
-  test("an account whose token signs in as someone else is rejected at startup", async () => {
+  test("an account whose token signs in as someone else is never served under the name it claims: if it's the ONLY configured account, zero accounts would be served, so startup still exits", async () => {
     const bad: Config = { url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
-    await expect(createRocketr(bad)).rejects.toThrow('account "claude" signs in as @lead');
+    await expect(createRocketr(bad)).rejects.toThrow('"claude": signs in as @lead, not @claude');
+  });
+
+  test("the same drifted account is excluded, not fatal, when another account is healthy: blast radius changed, the guarantee didn't", async () => {
+    const cfg: Config = {
+      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
+    };
+    const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
+    try {
+      expect([...isolated.accounts.keys()]).toEqual(["lead"]);
+      expect(isolated.excludedAccounts).toEqual([{ name: "claude", detail: "signs in as @lead, not @claude" }]);
+      const url = `http://127.0.0.1:${(await isolated.listen()).port}`;
+      // an excluded account must never fall through to some other account's session
+      await expect(FakeConnection.connect(url, { headers: { "x-rocketr-account": "claude" } })).rejects.toThrow();
+      const stillLead = await FakeConnection.connect(url, { headers: { "x-rocketr-account": "lead" } });
+      expect((await stillLead.callTool("whoami")).username).toBe("lead");
+      await stillLead.disconnect();
+    } finally {
+      await isolated.stop();
+    }
+  });
+
+  test("multi-account drift: healthy accounts come up and the process does not throw; a 401 account is excluded the same way as a username mismatch", async () => {
+    const cfg: Config = {
+      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      accounts: [
+        { name: "claude", userId: "bot1", token: "tok" }, // healthy
+        { name: "lead", userId: "bot2", token: "tok2" }, // healthy
+        { name: "renamed", userId: "bot2", token: "tok2" }, // signs in as "lead", not "renamed": drifted
+        { name: "ghost", userId: "bot3", token: "nope" }, // unknown to the server: 401
+      ],
+    };
+    const multi = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
+    try {
+      await multi.listen();
+      expect([...multi.accounts.keys()].sort()).toEqual(["claude", "lead"]);
+      expect(multi.excludedAccounts.map((f) => f.name).sort()).toEqual(["ghost", "renamed"]);
+      expect(multi.excludedAccounts.find((f) => f.name === "ghost")?.detail).toContain("401");
+    } finally {
+      await multi.stop();
+    }
+  });
+
+  test("the consolidated startup error names EVERY failed account, not just the first (this would fail against first-failure-only behavior)", async () => {
+    const cfg: Config = {
+      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      accounts: [
+        { name: "claude", userId: "bot1", token: "tok" },
+        { name: "renamed", userId: "bot2", token: "tok2" },
+        { name: "ghost", userId: "bot3", token: "nope" },
+      ],
+    };
+    const partial = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
+    try {
+      await partial.listen();
+      const consolidated = partial.activity.snapshot().events
+        .filter((e): e is Extract<typeof e, { type: "log" }> => e.type === "log")
+        .map((e) => e.message)
+        .find((m) => m.includes("startup preflight"));
+      expect(consolidated).toBeDefined();
+      // the whole point of the fix: both failed accounts are named in the ONE message, not just the first
+      expect(consolidated).toContain("renamed");
+      expect(consolidated).toContain("ghost");
+    } finally {
+      await partial.stop();
+    }
+  });
+
+  test("when every configured account fails, createRocketr rejects with one message naming all of them", async () => {
+    const allBad: Config = {
+      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      accounts: [{ name: "renamed", userId: "bot2", token: "tok2" }, { name: "ghost", userId: "bot3", token: "nope" }],
+    };
+    let err: Error | undefined;
+    try { await createRocketr(allBad); } catch (e) { err = e as Error; }
+    expect(err?.message).toContain("renamed");
+    expect(err?.message).toContain("ghost");
+    expect(err?.message).toContain("2 of 2");
   });
 });
 
@@ -322,6 +400,7 @@ describe("web app", () => {
     expect(s.agents).toHaveLength(1);
     expect(s.agents[0]).toMatchObject({ name: "main", calls: 1, headers: { "x-rocketr-account": "claude" } });
     expect(s.accounts.map((a: any) => a.username)).toEqual(["claude", "lead"]);
+    expect(s.excludedAccounts).toEqual([]); // no lie by omission when there's nothing to omit
     expect(JSON.stringify(s)).not.toContain("secret");
   });
 
@@ -331,6 +410,22 @@ describe("web app", () => {
     const s = await (await fetch(base + "/api/snapshot")).json() as any;
     expect(s.pendingByAccount).toEqual({ lead: 1 });
     expect(JSON.stringify(s.pendingByAccount)).not.toContain("queued");
+  });
+
+  test("snapshot names excluded accounts and why, so a partial outage isn't invisible in the web UI", async () => {
+    const cfg: Config = {
+      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
+    };
+    const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
+    try {
+      const url = `http://127.0.0.1:${(await isolated.listen()).port}`;
+      const s = await (await fetch(url + "/api/snapshot")).json() as any;
+      expect(s.accounts.map((a: any) => a.username)).toEqual(["lead"]);
+      expect(s.excludedAccounts).toEqual([{ name: "claude", detail: "signs in as @lead, not @claude" }]);
+    } finally {
+      await isolated.stop();
+    }
   });
 
   test("the stream carries tool calls live", async () => {
