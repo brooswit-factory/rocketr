@@ -1,7 +1,7 @@
 import { Elysia, type AnyElysia } from "elysia";
 import { thatch, type Connection, type Frame, type McpHandle } from "@brooswit/thatch";
 import type { Config } from "./config.js";
-import { RocketChat, type Subscription, type User } from "./rocketchat.js";
+import { RocketChat, RocketChatError, type Subscription, type User } from "./rocketchat.js";
 import { Batcher, Watcher, toFrame, type InboundEvent } from "./watcher.js";
 import { Activity } from "./activity.js";
 import { buildTools, instrument } from "./tools.js";
@@ -31,11 +31,35 @@ export interface Pending {
   frame: Frame;
 }
 
+/** A configured account excluded from service at startup, and why. */
+export interface AccountFailure {
+  /** The name configured in ROCKETR_ACCOUNTS — not necessarily the server's own username for it. */
+  name: string;
+  /** Human-readable: a username mismatch (names the server's actual username) or a 401. */
+  detail: string;
+}
+
+/**
+ * One consolidated message naming every failed account, so a reader can tell a coordinated rename
+ * (many accounts, consistent pattern) apart from a single broken one. Shared by the "some accounts
+ * failed" log line and the "every account failed" thrown error, so the two cases never diverge.
+ */
+function describeAccountFailures(failures: AccountFailure[], total: number): string {
+  const lines = failures.map((f) => `  - "${f.name}": ${f.detail}`).join("\n");
+  return [
+    `rocketr: ${failures.length} of ${total} configured account(s) failed startup preflight:`,
+    lines,
+    `Update ROCKETR_ACCOUNTS/secrets.env to match the current server-side usernames, or fix the token(s).`,
+  ].join("\n");
+}
+
 export interface Rocketr {
   app: AnyElysia;
   mcp: McpHandle;
-  /** Keyed by Rocket.Chat username. */
+  /** Keyed by Rocket.Chat username. Only accounts that passed the startup preflight. */
   accounts: Map<string, Account>;
+  /** Configured accounts excluded at startup (username mismatch or 401), with why. */
+  excludedAccounts: AccountFailure[];
   activity: Activity;
   /** Frames waiting for a session of their account with a live channel stream. */
   pending: Pending[];
@@ -54,17 +78,48 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch; p
   const presences = new Map<string, Pick<Presence, "setListening" | "stop">>();
   let delivering = Promise.resolve(0);
 
+  // Every configured account is checked, even after an earlier one fails: stopping at the first
+  // failure would only ever name that one account, leaving a reader unable to tell a coordinated
+  // rename (many accounts, consistent pattern) apart from a single broken one.
   const clients: Array<{ rc: RocketChat; self: User }> = [];
+  const failures: AccountFailure[] = [];
   for (const a of cfg.accounts) {
     const rc = new RocketChat({ url: cfg.url, userId: a.userId, token: a.token, ...(deps.fetch ? { fetch: deps.fetch } : {}) });
-    const self = await rc.me();
-    // the header names the account by username, so a name that doesn't match its token would be a lie
-    if (self.username !== a.name) throw new Error(`rocketr: account "${a.name}" signs in as @${self.username} — fix ROCKETR_ACCOUNTS or its token`);
+    let self: User;
+    try {
+      self = await rc.me();
+    } catch (err) {
+      const status = err instanceof RocketChatError ? err.status : undefined;
+      failures.push({ name: a.name, detail: status === 401 ? "401 Unauthorized — token rejected" : `preflight failed: ${(err as Error).message}` });
+      continue;
+    }
+    // The header names the account by username, so a name that doesn't match its token would be a lie:
+    // never serve it under the name it claims. It is excluded below, not thrown — one drifted account
+    // must not take every other, healthy account down with it.
+    if (self.username !== a.name) {
+      failures.push({ name: a.name, detail: `signs in as @${self.username}, not @${a.name}` });
+      continue;
+    }
     clients.push({ rc, self });
     presences.set(self.username, (deps.presence ?? ((options) => new Presence(options)))({
       url: cfg.url, userId: a.userId, token: a.token,
       log: (message) => log(`@${self.username}: ${message}`),
     }));
+  }
+
+  if (failures.length) {
+    const message = describeAccountFailures(failures, cfg.accounts.length);
+    if (failures.length === cfg.accounts.length) {
+      // Every configured account failed: zero accounts would be served. Reporting "healthy" while
+      // serving nothing would be its own silent failure, so this exits non-zero on purpose —
+      // deliberately keeping the crash/restart signal for a config that serves nobody. Because that
+      // re-triggers the restart loop, this is the SAME message (via describeAccountFailures) that a
+      // partial failure only logs: whichever path runs, the journal gets one consolidated, actionable
+      // line. Restarting fast against a mistake that a human hasn't fixed yet is unhelpful noise, so
+      // systemd/rocketr.service's RestartSec/RestartSteps back off progressively instead of a flat 5s.
+      throw new Error(message);
+    }
+    log(message);
   }
 
   /**
@@ -181,6 +236,8 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch; p
     .get("/", () => new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } }))
     .get("/api/snapshot", () => ({
       accounts: [...accounts.values()].map((a) => ({ id: a.self._id, username: a.self.username })),
+      // So a partial outage never reads as "all healthy": named explicitly, not just absent from `accounts`.
+      excludedAccounts: failures,
       server: cfg.url,
       version: VERSION,
       pending: pending.length,
@@ -206,12 +263,13 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch; p
 
   let retry: ReturnType<typeof setInterval> | undefined;
   return {
-    app, mcp, accounts, activity, pending, deliver,
+    app, mcp, accounts, excludedAccounts: failures, activity, pending, deliver,
     async listen() {
       app.listen({ hostname: cfg.host, port: cfg.port, idleTimeout: 0 });
       for (const a of accounts.values()) a.watcher.start();
       retry = setInterval(() => { if (pending.length) void deliver(); }, Math.max(cfg.pollMs, 1000));
-      log(`listening on http://${cfg.host}:${app.server!.port} as ${[...accounts.keys()].map((u) => `@${u}`).join(", ")}`);
+      log(`listening on http://${cfg.host}:${app.server!.port} as ${[...accounts.keys()].map((u) => `@${u}`).join(", ")}` +
+        (failures.length ? ` (excluding ${failures.length} account(s): ${failures.map((f) => `"${f.name}"`).join(", ")} — see the startup preflight error above)` : ""));
       return { port: app.server!.port! };
     },
     async stop() {
