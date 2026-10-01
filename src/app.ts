@@ -178,6 +178,7 @@ export async function createRocketr(cfg: Config, deps: {
     allowUnauthenticatedLoopback: cfg.allowUnauthenticatedLoopback,
     requestIP,
     onUnauthenticatedLoopback: (name) => log(`@${name}: connected with no client credential (ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK) — set ROCKETR_ACCOUNT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_CLIENT_SECRET to require one`),
+    onRefused: ({ account, ip, reason }) => log(`refused account=${account} ip=${ip} reason=${reason}`),
     ...(deps.authRateLimit ? { rateLimit: deps.authRateLimit } : {}),
   });
   /** The observer app (/, /api/snapshot, /api/stream) has no per-account auth — it shows every account's

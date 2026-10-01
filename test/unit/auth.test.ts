@@ -87,6 +87,7 @@ describe("createAuthenticator", () => {
     known: (a: string) => a === "claude",
     requestIP: () => "198.51.100.1",
     onUnauthenticatedLoopback: () => {},
+    onRefused: () => {},
   };
 
   test("an unknown account is refused even with a correct-looking bearer", () => {
@@ -156,5 +157,138 @@ describe("createAuthenticator", () => {
     expect(auth(req({ authorization: "Bearer wrong" }), "claude")).toBe(false);
     expect(auth(req({ authorization: "Bearer wrong" }), "claude")).toBe(false);
     expect(auth(req({ authorization: `Bearer ${secret}` }), "claude")).toBe(false); // now locked out
+  });
+
+  describe("refusal log (A2)", () => {
+    const refusals = () => { const log: Array<{ account: string; ip: string; reason: string }> = []; return { log, onRefused: (info: any) => log.push(info) }; };
+
+    test("each reason logs exactly what happened", () => {
+      const secret = "s".repeat(32);
+      const { log, onRefused } = refusals();
+      const auth = createAuthenticator({ ...base, onRefused, secretOf: (a) => (a === "claude" ? secret : undefined), loopbackBind: true, allowUnauthenticatedLoopback: false });
+
+      auth(req(), "nobody"); // unknown-account
+      auth(req({ authorization: "Bearer " + "w".repeat(32) }), "claude"); // bad-secret
+      auth(req(), "claude"); // missing-secret (secret configured, nothing presented)
+
+      expect(log).toEqual([
+        { account: "nobody", ip: "198.51.100.1", reason: "unknown-account" },
+        { account: "claude", ip: "198.51.100.1", reason: "bad-secret" },
+        { account: "claude", ip: "198.51.100.1", reason: "missing-secret" },
+      ]);
+    });
+
+    test("an account with no secret configured, refused because the transition flag is off, logs missing-secret", () => {
+      const { log, onRefused } = refusals();
+      const auth = createAuthenticator({ ...base, onRefused, secretOf: () => undefined, loopbackBind: true, allowUnauthenticatedLoopback: false });
+      auth(req(), "claude");
+      expect(log).toEqual([{ account: "claude", ip: "198.51.100.1", reason: "missing-secret" }]);
+    });
+
+    test("the allowed unauthenticated-loopback path is not a refusal: no log line", () => {
+      const { log, onRefused } = refusals();
+      const auth = createAuthenticator({ ...base, onRefused, secretOf: () => undefined, loopbackBind: true, allowUnauthenticatedLoopback: true });
+      expect(auth(req(), "claude")).toBe(true);
+      expect(log).toEqual([]);
+    });
+
+    test("never logs the secret, the Authorization header, or any part of it", () => {
+      const secret = "s".repeat(32);
+      const { log, onRefused } = refusals();
+      const auth = createAuthenticator({ ...base, onRefused, secretOf: () => secret, loopbackBind: true, allowUnauthenticatedLoopback: true });
+      auth(req({ authorization: `Bearer ${secret}-but-wrong` }), "claude");
+      const dump = JSON.stringify(log);
+      expect(dump).not.toContain(secret);
+      expect(dump.toLowerCase()).not.toContain("bearer");
+      expect(dump.toLowerCase()).not.toContain("authorization");
+    });
+
+    test("a client-supplied account name is stripped of control characters and truncated before logging", () => {
+      const { log, onRefused } = refusals();
+      const auth = createAuthenticator({ ...base, onRefused, known: () => false, secretOf: () => undefined, loopbackBind: true, allowUnauthenticatedLoopback: false });
+      const dirty = "evil name" + "x".repeat(100);
+      auth(req(), dirty);
+      expect(log[0]!.account).not.toMatch(/[\x00-\x1f\x7f]/);
+      expect(log[0]!.account.length).toBeLessThanOrEqual(65); // MAX_LOGGED_ACCOUNT_LEN + the truncation marker
+    });
+
+    test("a locked key logs once, then suppresses repeats until the lockout clears", () => {
+      const secret = "s".repeat(32);
+      const { log, onRefused } = refusals();
+      const auth = createAuthenticator({
+        ...base, onRefused, secretOf: () => secret, loopbackBind: true, allowUnauthenticatedLoopback: true,
+        rateLimit: { maxFailures: 1, windowMs: 10_000, lockoutMs: 10_000 },
+      });
+      auth(req({ authorization: "Bearer wrong" }), "claude"); // bad-secret, triggers the lock
+      auth(req({ authorization: `Bearer ${secret}` }), "claude"); // locked — logged once
+      auth(req({ authorization: `Bearer ${secret}` }), "claude"); // locked — suppressed
+      auth(req({ authorization: `Bearer ${secret}` }), "claude"); // locked — suppressed
+      expect(log.map((l) => l.reason)).toEqual(["bad-secret", "locked"]);
+    });
+  });
+
+  describe("per-(IP, account) lockout (A3)", () => {
+    test("a bad client on account X does not lock account Y at the same IP", () => {
+      const secretX = "x".repeat(32), secretY = "y".repeat(32);
+      const auth = createAuthenticator({
+        ...base, known: (a) => a === "x" || a === "y", secretOf: (a) => (a === "x" ? secretX : secretY),
+        loopbackBind: true, allowUnauthenticatedLoopback: true,
+        rateLimit: { maxFailures: 1, windowMs: 10_000, lockoutMs: 10_000 },
+      });
+      expect(auth(req({ authorization: "Bearer wrong" }), "x")).toBe(false); // locks (ip, x)
+      expect(auth(req({ authorization: `Bearer ${secretY}` }), "y")).toBe(true); // (ip, y) unaffected
+    });
+
+    test("unknown-account attempts from one IP share a single per-IP bucket, isolated from known accounts at that IP", () => {
+      const secret = "s".repeat(32);
+      const auth = createAuthenticator({
+        ...base, known: (a) => a === "claude", secretOf: () => secret, loopbackBind: true, allowUnauthenticatedLoopback: true,
+        rateLimit: { maxFailures: 2, windowMs: 10_000, lockoutMs: 10_000 },
+      });
+      expect(auth(req(), "ghost1")).toBe(false);
+      expect(auth(req(), "ghost2")).toBe(false); // second distinct unknown name from the same IP — still locks the shared bucket
+      expect(auth(req(), "ghost3")).toBe(false); // now locked
+      expect(auth(req({ authorization: `Bearer ${secret}` }), "claude")).toBe(true); // claude's own key is untouched
+    });
+
+    test("a missing secret under the transition flag is never counted as a failure, so it cannot lock anyone out", () => {
+      const auth = createAuthenticator({
+        ...base, secretOf: () => undefined, loopbackBind: true, allowUnauthenticatedLoopback: false,
+        rateLimit: { maxFailures: 1, windowMs: 10_000, lockoutMs: 10_000 },
+      });
+      for (let i = 0; i < 5; i++) expect(auth(req(), "claude")).toBe(false); // refused every time, never locked
+    });
+
+    test("a success resets the key, clearing any accumulated failures", () => {
+      const secret = "s".repeat(32);
+      const auth = createAuthenticator({
+        ...base, secretOf: () => secret, loopbackBind: true, allowUnauthenticatedLoopback: true,
+        rateLimit: { maxFailures: 2, windowMs: 10_000, lockoutMs: 10_000 },
+      });
+      expect(auth(req({ authorization: "Bearer wrong" }), "claude")).toBe(false);
+      expect(auth(req({ authorization: `Bearer ${secret}` }), "claude")).toBe(true); // success resets the count
+      expect(auth(req({ authorization: "Bearer wrong" }), "claude")).toBe(false); // 1 of 2 again, not locked yet
+      expect(auth(req({ authorization: `Bearer ${secret}` }), "claude")).toBe(true);
+    });
+
+    test("recovers after the lockout window elapses", () => {
+      const limiter = new FailureRateLimiter({ maxFailures: 1, windowMs: 10_000, lockoutMs: 100 });
+      limiter.recordFailure("ip claude", 0);
+      expect(limiter.isLocked("ip claude", 50)).toBe(true);
+      expect(limiter.isLocked("ip claude", 150)).toBe(false);
+    });
+
+    test("the map stays bounded: a flood of distinct keys evicts the oldest one, clearing its lockout too", () => {
+      const limiter = new FailureRateLimiter({ maxFailures: 1, windowMs: 10_000, lockoutMs: 10_000, maxKeys: 3 });
+      limiter.recordFailure("ip1", 0); // locks immediately (maxFailures: 1)
+      limiter.recordFailure("ip2", 0);
+      limiter.recordFailure("ip3", 0);
+      expect(limiter.isLocked("ip1", 0)).toBe(true);
+      limiter.recordFailure("ip4", 0); // a 4th distinct key — evicts the oldest (ip1)
+      expect(limiter.isLocked("ip1", 0)).toBe(false); // evicted — spoofing distinct names can't grow the map forever
+      expect(limiter.isLocked("ip2", 0)).toBe(true);
+      expect(limiter.isLocked("ip3", 0)).toBe(true);
+      expect(limiter.isLocked("ip4", 0)).toBe(true);
+    });
   });
 });
