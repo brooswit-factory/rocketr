@@ -1,0 +1,46 @@
+name: release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Check release tag
+        id: check
+        run: |
+          set -euo pipefail
+          V="$(node -p "require('./package.json').version")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$V" >/dev/null 2>&1; then
+            echo "already released: v$V"
+            echo "release_needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        if: steps.check.outputs.release_needed == 'true'
+        run: |
+          set -euo pipefail
+          V="${{ steps.check.outputs.version }}"
+          gh release create "v$V" \
+            --target "$GITHUB_SHA" \
+            --title "rocketr v$V" \
+            --generate-notes
