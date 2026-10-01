@@ -16,7 +16,22 @@ export interface Message {
   tmid?: string;
   tcount?: number;
   mentions?: Array<{ _id: string; username?: string }>;
-  attachments?: Array<{ title?: string; title_link?: string; text?: string }>;
+  attachments?: Attachment[];
+}
+
+export interface Attachment {
+  title?: string;
+  title_link?: string;
+  text?: string;
+  /** Set by Rocket.Chat per kind of upload; the file's own MIME type is only known once it is fetched. */
+  image_type?: string;
+  audio_type?: string;
+  video_type?: string;
+  type?: string;
+  image_size?: number;
+  audio_size?: number;
+  video_size?: number;
+  size?: number;
 }
 
 /** A room's notification level, as Rocket.Chat's per-room "Notification Preferences" set it. */
@@ -104,6 +119,24 @@ export class RocketChat {
   /** Newest-first, as Rocket.Chat returns it. */
   async history(room: Room, count: number) {
     return (await this.call<{ messages: Message[] }>(HISTORY[room.t], { query: { roomId: room._id, count } })).messages;
+  }
+
+  async message(msgId: string) {
+    return (await this.call<{ message: Message }>("chat.getMessage", { query: { msgId } })).message;
+  }
+
+  /**
+   * GET a file the server hosts, as this account. Only paths under the server's own file-upload routes are
+   * followed: an attachment's `title_link` is user-controlled text, so it must never steer the account's
+   * credentials to another host or another route.
+   */
+  async fetchUpload(link: string): Promise<Response> {
+    const base = new URL(this.o.url);
+    const target = new URL(link, base);
+    if (target.origin !== base.origin || !/^\/(file-upload|ufs)\//.test(target.pathname)) throw new Error("Attachment link is not a Rocket.Chat upload");
+    const res = await this.fetch(target, { headers: { "X-User-Id": this.o.userId, "X-Auth-Token": this.o.token }, redirect: "error" });
+    if (!res.ok) throw new RocketChatError(res.status, target.pathname, res.statusText);
+    return res;
   }
 
   async threadMessages(tmid: string, count: number) {

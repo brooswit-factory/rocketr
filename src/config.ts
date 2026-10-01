@@ -29,6 +29,10 @@ export interface Config {
   /** Messages in one room and thread arriving within this many ms of each other become one turn. 0 = no batching. */
   batchMs: number;
   pollMs: number;
+  /** Where `download_attachment` saves files (one subdirectory per account). */
+  attachmentDir: string;
+  /** Largest attachment `download_attachment` will save. */
+  attachmentMaxBytes: number;
   host: string;
   port: number;
 }
@@ -103,6 +107,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     migrateLegacyAllToMentions: bool("ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS"),
     batchMs: int("ROCKETR_BATCH_MS", 2000),
     pollMs: int("ROCKETR_POLL_MS", 3000),
+    attachmentDir: get("ROCKETR_ATTACHMENT_DIR") || join(homedir(), ".local", "share", "rocketr", "attachments"),
+    attachmentMaxBytes: int("ROCKETR_ATTACHMENT_MAX_BYTES", 25 * 1024 * 1024),
     host: get("ROCKETR_HOST") || "127.0.0.1",
     port: int("ROCKETR_PORT", 8790),
   };

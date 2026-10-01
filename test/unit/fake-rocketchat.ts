@@ -22,6 +22,9 @@ export class FakeRocketChat {
   readonly groupMembers = new Map<string, Set<string>>();
   readonly invited: Array<{ rid: string; userId: string }> = [];
   readonly kicked: Array<{ rid: string; userId: string }> = [];
+  /** Files served at /file-upload/..., keyed by path. */
+  readonly files = new Map<string, { type: string; body: Buffer; lengthHeader?: boolean }>();
+  readonly fileRequests: string[] = [];
   private n = 0;
   server!: ReturnType<typeof Bun.serve>;
 
@@ -56,6 +59,11 @@ export class FakeRocketChat {
     const me = this.users.find((u) => u._id === uid);
     if (!me || this.tokens.get(uid) !== req.headers.get("x-auth-token")) return json({ success: false, error: "You must be logged in to do this." }, 401);
     const url = new URL(req.url);
+    if (url.pathname.startsWith("/file-upload/")) {
+      this.fileRequests.push(url.pathname);
+      const f = this.files.get(url.pathname);
+      return f ? new Response(f.body, { headers: { "content-type": f.type, ...(f.lengthHeader === false ? {} : { "content-length": String(f.body.length) }) } }) : new Response("nope", { status: 404 });
+    }
     const q = (k: string) => url.searchParams.get(k);
     const body = req.method === "POST" ? await req.json() as any : {};
     const route = url.pathname.replace("/api/v1/", "");
@@ -75,6 +83,12 @@ export class FakeRocketChat {
         const ts = new Date().toISOString();
         const m: Message = { _id: `s${++this.n}`, rid: body.message.rid, msg: body.message.msg, ts, _updatedAt: ts, u: me, ...(body.message.tmid ? { tmid: body.message.tmid } : {}) };
         this.messages.push(m);
+        return json({ success: true, message: m });
+      }
+      case "chat.getMessage": {
+        const m = this.messages.find((x) => x._id === q("msgId"));
+        // like the server: a message in a room this account is not subscribed to does not exist for it
+        if (!m || !this.subs.get(uid)?.some((x) => x.rid === m.rid)) return json({ success: false, error: "Message not found" }, 400);
         return json({ success: true, message: m });
       }
       case "chat.react": this.reactions.push({ uid, ...body }); return json({ success: true });

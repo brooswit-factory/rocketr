@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import { createRocketr, type Rocketr } from "../../src/app.js";
 import type { Config } from "../../src/config.js";
 import { FakeRocketChat } from "./fake-rocketchat.js";
 
-let rcServer: FakeRocketChat, r: Rocketr, base: string;
+let rcServer: FakeRocketChat, r: Rocketr, base: string, dir: string;
 const conns: FakeConnection[] = [];
 const presenceStates = new Map<string, boolean>();
 const ON = { "x-rocketr-channel": "on" };
@@ -15,7 +18,9 @@ const connect = async (headers: Record<string, string> = {}) => { const c = awai
 
 beforeEach(async () => {
   rcServer = new FakeRocketChat().start();
+  dir = await mkdtemp(join(tmpdir(), "rocketr-att-"));
   const cfg: Config = {
+   attachmentDir: dir, attachmentMaxBytes: 1024,
     url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
     accounts: [{ name: "claude", userId: "bot1", token: "tok" }, { name: "lead", userId: "bot2", token: "tok2" }],
   };
@@ -31,13 +36,14 @@ afterEach(async () => {
   for (const c of conns.splice(0)) await c.disconnect().catch(() => {});
   await r.stop();
   rcServer.stop();
+  await rm(dir, { recursive: true, force: true });
 });
 
 describe("tools", () => {
   test("lists the tools", async () => {
     const c = await connect();
     expect((await c.listTools()).map((t) => t.name).sort())
-      .toEqual(["add_member", "get_notifications", "list_rooms", "react_to_message", "read_messages", "remove_member", "send_image", "send_message", "set_notifications", "whoami"]);
+      .toEqual(["add_member", "download_attachment", "get_notifications", "list_rooms", "react_to_message", "read_messages", "remove_member", "send_image", "send_message", "set_notifications", "whoami"]);
   });
 
   test("get_notifications and set_notifications read and write the room's own preference", async () => {
@@ -240,7 +246,7 @@ describe("accounts", () => {
 
   test("an opt-in default account serves a client that names none, and still refuses a wrong name", async () => {
     const single = await createRocketr({
-      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
       accounts: [{ name: "claude", userId: "bot1", token: "tok" }], defaultAccount: "claude",
     }, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
     const url = `http://127.0.0.1:${(await single.listen()).port}`;
@@ -303,13 +309,13 @@ describe("accounts", () => {
   });
 
   test("an account whose token signs in as someone else is never served under the name it claims: if it's the ONLY configured account, zero accounts would be served, so startup still exits", async () => {
-    const bad: Config = { url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
+    const bad: Config = { attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
     await expect(createRocketr(bad)).rejects.toThrow('"claude": signs in as @lead, not @claude');
   });
 
   test("the same drifted account is excluded, not fatal, when another account is healthy: blast radius changed, the guarantee didn't", async () => {
     const cfg: Config = {
-      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
       accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
     };
     const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
@@ -329,7 +335,7 @@ describe("accounts", () => {
 
   test("multi-account drift: healthy accounts come up and the process does not throw; a 401 account is excluded the same way as a username mismatch", async () => {
     const cfg: Config = {
-      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
       accounts: [
         { name: "claude", userId: "bot1", token: "tok" }, // healthy
         { name: "lead", userId: "bot2", token: "tok2" }, // healthy
@@ -350,7 +356,7 @@ describe("accounts", () => {
 
   test("the consolidated startup error names EVERY failed account, not just the first (this would fail against first-failure-only behavior)", async () => {
     const cfg: Config = {
-      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
       accounts: [
         { name: "claude", userId: "bot1", token: "tok" },
         { name: "renamed", userId: "bot2", token: "tok2" },
@@ -375,7 +381,7 @@ describe("accounts", () => {
 
   test("when every configured account fails, createRocketr rejects with one message naming all of them", async () => {
     const allBad: Config = {
-      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
       accounts: [{ name: "renamed", userId: "bot2", token: "tok2" }, { name: "ghost", userId: "bot3", token: "nope" }],
     };
     let err: Error | undefined;
@@ -414,7 +420,7 @@ describe("web app", () => {
 
   test("snapshot names excluded accounts and why, so a partial outage isn't invisible in the web UI", async () => {
     const cfg: Config = {
-      url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
       accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
     };
     const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
@@ -438,5 +444,78 @@ describe("web app", () => {
     while (!buf.includes('"type":"tool"')) buf += dec.decode((await reader.read()).value);
     await reader.cancel();
     expect(buf).toContain('"tool":"whoami"');
+  });
+});
+
+describe("download_attachment", () => {
+  const PNG = Buffer.from("89504e470d0a1a0a0000", "hex");
+  const withAttachment = (title: string, link: string, extra: Record<string, unknown> = {}) =>
+    rcServer.post("dm-boss", "boss", "see file", { attachments: [{ title, title_link: link, ...extra }] });
+  const call = async (args: Record<string, unknown>, headers: Record<string, string> = {}) => (await connect(headers)).callTool("download_attachment", args);
+  const fails = (args: Record<string, unknown>, msg: string | RegExp, headers: Record<string, string> = {}) =>
+    expect(call(args, headers)).rejects.toThrow(msg);
+
+  test("saves an allowed file under the configured dir and reports path, size and type", async () => {
+    rcServer.files.set("/file-upload/f1/shot.png", { type: "image/png", body: PNG });
+    const m = withAttachment("shot.png", "/file-upload/f1/shot.png");
+    const saved = (await call({ message_id: m._id })) as any;
+    expect(saved.path).toContain(`${m._id}-0-shot.png`);
+    expect(saved.size).toBe(PNG.length);
+    expect(saved.mime_type).toBe("image/png");
+    expect(await Bun.file(saved.path).bytes()).toEqual(new Uint8Array(PNG));
+    expect(saved.path.startsWith(dir)).toBe(true);
+  });
+
+  test("refuses a disallowed type and writes nothing", async () => {
+    rcServer.files.set("/file-upload/f2/x.exe", { type: "application/x-msdownload", body: Buffer.from("MZ") });
+    const m = withAttachment("x.exe", "/file-upload/f2/x.exe");
+    await fails({ message_id: m._id }, "not allowed");
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  test("refuses an oversize file whether or not the server declares a length", async () => {
+    const big = Buffer.alloc(2048, 1);
+    rcServer.files.set("/file-upload/f3/a.png", { type: "image/png", body: big });
+    rcServer.files.set("/file-upload/f4/b.png", { type: "image/png", body: big, lengthHeader: false });
+    for (const [id, link] of [["a", "/file-upload/f3/a.png"], ["b", "/file-upload/f4/b.png"]] as const) {
+      const m = withAttachment(`${id}.png`, link);
+      await fails({ message_id: m._id }, /limit/);
+    }
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  test("a traversal filename stays inside the dir", async () => {
+    rcServer.files.set("/file-upload/f5/evil", { type: "text/plain", body: Buffer.from("hi") });
+    const m = withAttachment("../../../etc/cron.d/evil", "/file-upload/f5/evil");
+    const saved = (await call({ message_id: m._id })) as any;
+    expect(saved.path.startsWith(join(dir, "claude") + "/")).toBe(true);
+    expect(saved.path).not.toContain("..");
+  });
+
+  test("two messages with the same filename do not overwrite each other", async () => {
+    rcServer.files.set("/file-upload/f6/a.png", { type: "image/png", body: PNG });
+    const a = withAttachment("same.png", "/file-upload/f6/a.png"), b = withAttachment("same.png", "/file-upload/f6/a.png");
+    await call({ message_id: a._id }); await call({ message_id: b._id });
+    expect((await readdir(join(dir, "claude"))).length).toBe(2);
+  });
+
+  test("a missing message, missing attachment index, or non-upload link is an error", async () => {
+    await fails({ message_id: "nope" }, /not found/i);
+    const plain = rcServer.post("dm-boss", "boss", "no files");
+    await fails({ message_id: plain._id }, "no downloadable attachment");
+    const m = withAttachment("a.png", "/file-upload/f7/a.png");
+    await fails({ message_id: m._id, index: 3 }, "no downloadable attachment");
+    const ssrf = withAttachment("a.png", "http://127.0.0.1:1/file-upload/x/a.png");
+    await fails({ message_id: ssrf._id }, "not a Rocket.Chat upload");
+    const other = withAttachment("a.png", "/api/v1/users.list");
+    await fails({ message_id: other._id }, "not a Rocket.Chat upload");
+  });
+
+  test("a message in a room the account cannot read is refused before any file request", async () => {
+    rcServer.files.set("/file-upload/f8/a.png", { type: "image/png", body: PNG });
+    const m = withAttachment("a.png", "/file-upload/f8/a.png"); // dm-boss: claude is in it, lead is not
+    const before = rcServer.fileRequests.length;
+    await fails({ message_id: m._id }, /not found/i, LEAD);
+    expect(rcServer.fileRequests.length).toBe(before);
   });
 });

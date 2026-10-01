@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { loadConfig, parseEnvFile } from "../../src/config.js";
 
 const file = (text: string) => { const p = join(mkdtempSync(join(tmpdir(), "rocketr-")), "secrets.env"); writeFileSync(p, text); return p; };
@@ -22,7 +22,14 @@ describe("loadConfig", () => {
       url: "https://chat.example",
       accounts: [{ name: "claude", userId: "u1", token: "t1" }, { name: "rocketr-lead", userId: "u2", token: "t2" }],
       defaultNotifications: "mentions", migrateLegacyAllToMentions: false, batchMs: 2000, pollMs: 3000, host: "127.0.0.1", port: 8790,
+      attachmentDir: join(homedir(), ".local", "share", "rocketr", "attachments"), attachmentMaxBytes: 25 * 1024 * 1024,
     });
+  });
+
+  test("attachment dir and cap are configurable", () => {
+    const c = loadConfig({ ROCKETR_ENV_FILE: file(base + "ROCKETR_ATTACHMENT_DIR=/srv/att\nROCKETR_ATTACHMENT_MAX_BYTES=1000\n") });
+    expect(c.attachmentDir).toBe("/srv/att");
+    expect(c.attachmentMaxBytes).toBe(1000);
   });
 
   test("process env wins over the file", () => {

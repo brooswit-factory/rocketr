@@ -1,5 +1,7 @@
+import { mkdir, rename, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { z, type Connection, type ToolDef } from "@brooswit/thatch";
-import { NOTIFY_LEVELS, type Message, type NotifyLevel, type RocketChat, type Room, type User } from "./rocketchat.js";
+import { NOTIFY_LEVELS, type Attachment, type Message, type NotifyLevel, type RocketChat, type Room, type User } from "./rocketchat.js";
 import { levelOf } from "./watcher.js";
 import type { Activity } from "./activity.js";
 
@@ -12,6 +14,18 @@ const REACTION_GUIDANCE = "Acknowledge each message you read from the operator o
 const ROOM = z.string().min(1).describe('Room: an id (e.g. the room_id from a <channel source="rocketr"> tag), "#channel", or "@username" for a DM');
 const USERNAME = z.string().min(1).describe("Username, without the @");
 
+/** What `download_attachment` will save: images, audio, PDF and plain text. Anything else is refused. */
+export const ATTACHMENT_TYPES = [/^image\/(png|jpeg|gif|webp)$/, /^audio\/[a-z0-9.+-]+$/, /^application\/pdf$/, /^text\/plain$/];
+export const attachmentAllowed = (mime: string) => ATTACHMENT_TYPES.some((re) => re.test(mime));
+export interface AttachmentOptions { dir: string; maxBytes: number }
+
+const attachmentView = (a: Attachment, index: number) => ({
+  index, title: a.title ?? null,
+  type: a.image_type ?? a.audio_type ?? a.video_type ?? a.type ?? null,
+  size: a.image_size ?? a.audio_size ?? a.video_size ?? a.size ?? null,
+  downloadable: !!a.title_link,
+});
+
 export const view = (m: Message) => ({
   id: m._id,
   ts: m.ts,
@@ -20,6 +34,7 @@ export const view = (m: Message) => ({
   ...(m.t ? { system: m.t } : {}),
   ...(m.tmid ? { thread_id: m.tmid } : {}),
   ...(m.tcount ? { replies: m.tcount } : {}),
+  ...(m.attachments?.some((a) => a.title_link) ? { attachments: m.attachments.map(attachmentView) } : {}),
 });
 
 /** "@user" → that DM; "#name" or a bare name → the room by name; anything else is tried as an id first. */
@@ -34,7 +49,7 @@ export interface AccountHandle { rc: RocketChat; self: User }
 
 export type NotificationChange = (account: string, roomId: string, level: NotifyLevel) => void;
 
-export function buildTools(accountOf: (c: Connection) => AccountHandle, url: string, fallback: NotifyLevel, onNotificationChange?: NotificationChange): Record<string, ToolDef<any>> {
+export function buildTools(accountOf: (c: Connection) => AccountHandle, url: string, fallback: NotifyLevel, onNotificationChange?: NotificationChange, attachments?: AttachmentOptions): Record<string, ToolDef<any>> {
   return {
     whoami: tool({
       description: "The Rocket.Chat account this session speaks as (chosen by its x-rocketr-account header).",
@@ -115,6 +130,48 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
         const r = await resolveRoom(rc, room);
         const m = await rc.sendImage(r._id, bytes, filename, mime_type, text, thread_id);
         return { sent: true, message_id: m._id, room_id: r._id };
+      },
+    }),
+    download_attachment: tool({
+      description:
+        "Save a file attached to a Rocket.Chat message to this machine and return its local path. Use the message id from read_messages " +
+        "(its `attachments` list shows what is there). Images (png/jpeg/gif/webp), audio, PDF and plain text only, up to a size cap; " +
+        "files land in a fixed rocketr directory, one folder per account.",
+      input: {
+        message_id: z.string().min(1).describe("The message that carries the attachment"),
+        index: z.number().int().min(0).max(49).optional().describe("Which attachment, from the message's attachments list (default 0)"),
+      },
+      handler: async ({ message_id, index = 0 }, c) => {
+        if (!attachments) throw new Error("Attachment downloads are not configured");
+        const { rc, self } = accountOf(c);
+        const m = await rc.message(message_id);
+        const a = m.attachments?.[index];
+        if (!a?.title_link) throw new Error(`Message ${message_id} has no downloadable attachment at index ${index}`);
+        const declared = attachmentView(a, index);
+        if (declared.size !== null && declared.size > attachments.maxBytes) throw new Error(`Attachment is ${declared.size} bytes; the limit is ${attachments.maxBytes}`);
+        const res = await rc.fetchUpload(a.title_link);
+        const mime = (res.headers.get("content-type") ?? declared.type ?? "").split(";")[0]!.trim().toLowerCase();
+        if (!attachmentAllowed(mime)) throw new Error(`Attachment type "${mime || "unknown"}" is not allowed`);
+        const length = Number(res.headers.get("content-length") ?? 0);
+        if (length > attachments.maxBytes) throw new Error(`Attachment is ${length} bytes; the limit is ${attachments.maxBytes}`);
+        // The size header is advisory: count what actually arrives and stop at the cap.
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        const reader = res.body!.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.length;
+          if (total > attachments.maxBytes) { await reader.cancel(); throw new Error(`Attachment exceeds the ${attachments.maxBytes}-byte limit`); }
+          chunks.push(value);
+        }
+        const safe = (a.title ?? "attachment").replace(/[^A-Za-z0-9._-]+/g, "_").replace(/\.{2,}/g, "_").replace(/^\.+/, "").slice(-100) || "attachment";
+        const dir = join(attachments.dir, self.username.replace(/[^A-Za-z0-9._-]/g, "_"));
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        const path = join(dir, `${message_id}-${index}-${safe}`);
+        const tmp = `${path}.part`;
+        try { await Bun.write(tmp, new Blob(chunks)); await rename(tmp, path); } catch (e) { await rm(tmp, { force: true }); throw e; }
+        return { path, mime_type: mime, size: total, message_id, index };
       },
     }),
     get_notifications: tool({

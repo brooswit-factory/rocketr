@@ -176,6 +176,23 @@ and the web app are all exercised over HTTP.
   description instead.
 - Polling, not Rocket.Chat's realtime API: a push lands within one poll interval.
 
+### Downloading attachments
+
+`read_messages` lists a message's attachments (`index`, `title`, `type`, `size`). `download_attachment` takes a
+`message_id` (and an `index`, default 0) and saves that file on the machine rocketr runs on, returning its absolute
+`path`, `mime_type` and `size`. It uses the calling account's own token and the existing REST routes, so an
+account can only fetch attachments of messages it can already read; no server change is needed.
+
+- Only links under the configured server's own `/file-upload/` or `/ufs/` routes are fetched (no redirects, no other host).
+- Allowed types: PNG, JPEG, GIF, WebP, audio (`audio/*`), PDF and plain text. Anything else is refused.
+- The size cap is enforced against the declared size, the `Content-Length` and the bytes actually received.
+- Files are saved as `<dir>/<account>/<message id>-<index>-<sanitised title>`, so one message's file can never replace another's.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ROCKETR_ATTACHMENT_DIR` | `~/.local/share/rocketr/attachments` | Where files are saved (one folder per account, mode 0700) |
+| `ROCKETR_ATTACHMENT_MAX_BYTES` | `26214400` (25 MiB) | Largest file saved |
+
 ### Posting screenshots
 
 Use `send_image` with `room`, `filename`, `mime_type`, and `data_base64` (base64
