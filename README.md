@@ -22,6 +22,53 @@ as that account, and only messages addressed to it are pushed to its sessions.
 Accounts are listed in `ROCKETR_ACCOUNTS`; each has `ROCKETR_ACCOUNT_<NAME>_USER_ID` and `_TOKEN`
 (name upper-cased, non-alphanumerics → `_`, so `rocketr-lead` → `ROCKETR_ACCOUNT_ROCKETR_LEAD_`).
 
+## Client authentication
+
+A connection names an account with `x-rocketr-account`, but naming one isn't proving it: without a
+per-account **client secret**, anyone who can reach the port and send that header IS that account.
+Set `ROCKETR_ACCOUNT_<NAME>_CLIENT_SECRET` (same name mangling as `_USER_ID`/`_TOKEN`, at least 32
+characters — generate one with `openssl rand -base64 32` or similar) and the client must send it as
+`Authorization: Bearer <secret>`; a missing or wrong bearer is refused (401, generic — the response
+never reveals whether the account exists or the secret was merely wrong). The client secret is
+**distinct from the Rocket.Chat token**: it is never accepted in the token's place, and rotating it
+never touches Rocket.Chat.
+
+An account with no client secret configured is refused the same way, **unless** both: the bind is
+loopback (`ROCKETR_HOST` is `127.0.0.1`, `::1` or `localhost`) and `ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK=true`.
+That flag is a **transition switch only** — its secure-by-default end state is `false`. A connection
+that uses this fallback logs a one-line warning naming the account (never a secret). A bind that
+isn't loopback refuses to start outright unless every configured account already has a secret —
+there is no fallback once the daemon is reachable from other machines.
+
+A client that fails auth repeatedly from the same source IP is locked out for a window (generic
+refusal, no distinction between "wrong secret" and "locked out"); auth never logs the presented
+secret or any prefix of it. Auth happens before any session, presence, or queued-message state is
+created for the connection, so a refused client leaves no trace and triggers no delivery.
+
+The observer web app (`/`, `/api/snapshot`, `/api/stream` — see below) carries **no** per-account
+auth of its own: it shows every connected account's activity, including message content. It stays
+**loopback-only** unconditionally, regardless of client secrets or `ROCKETR_HOST` — a non-loopback
+caller gets a plain 403. Exposing it beyond loopback is out of scope here (left to whatever fronts
+rocketr on a non-loopback bind, e.g. a reverse proxy with its own access control).
+
+**Staged rollout** (secure by default; the flag exists only to keep today's localhost callers working
+while secrets are issued one account at a time):
+
+1. Set a client secret for each account, one at a time, without setting the transition flag — each
+   account still works unauthenticated (loopback only) until its own secret is set, then starts
+   requiring it. No restart is needed to add a secret for an account still used over loopback; set it
+   when convenient.
+2. Once **every** configured account has a secret, confirm no caller still omits `Authorization`,
+   then leave `ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK` unset (default `false`) or explicitly remove it
+   if you had set it `true` during rollout.
+3. Only after every account has a secret can `ROCKETR_HOST` move off loopback — the daemon refuses to
+   start otherwise.
+
+**Rollback**: set `ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK=true` and restart — any account with **no**
+client secret configured goes back to being served unauthenticated, as long as the bind is still
+loopback. This does not remove or bypass any secret already configured: an account that has one
+keeps requiring it regardless of this flag.
+
 At startup, every configured account is checked (a token whose username doesn't match its configured
 name, or that gets a 401, would let `x-rocketr-account` name it with a lie). A drifted account is
 **excluded**, not fatal to the others: it's never served — a connection naming it is refused exactly
@@ -141,8 +188,10 @@ feed of tool calls (click to see arguments and result), each agent tagged with i
 and their delivery result, connects and disconnects. Only `x-agent-name` and `user-agent` are
 shown; other headers such as `authorization` never leave the process.
 
-The server binds to `127.0.0.1` by default. Anything that can reach the port can use the
-tools as the bot, so don't expose it.
+The server binds to `127.0.0.1` by default. The observer app itself is always loopback-only
+regardless of `ROCKETR_HOST` or client secrets — see **Client authentication** above — but the MCP
+endpoint follows `ROCKETR_HOST`/client secrets, so don't move it off loopback until every account has
+a secret.
 
 ## Configuration
 
@@ -151,6 +200,8 @@ tools as the bot, so don't expose it.
 | `ROCKETR_URL` | `ROCKETCHAT_URL` | Rocket.Chat base URL |
 | `ROCKETR_ACCOUNTS` | — | Comma-separated usernames rocketr signs in as (required) |
 | `ROCKETR_ACCOUNT_<NAME>_USER_ID`, `_TOKEN` | — | Each account's personal access token |
+| `ROCKETR_ACCOUNT_<NAME>_CLIENT_SECRET` | — (none) | Per-account bearer secret for MCP connections (≥32 chars), distinct from `_TOKEN` |
+| `ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK` | `false` | Transition only: let an account with no `_CLIENT_SECRET` connect while the bind is loopback |
 | `ROCKETR_DEFAULT_NOTIFICATIONS` | `mentions` | Level saved on rooms with no notification preference yet |
 | `ROCKETR_MIGRATE_LEGACY_ALL_TO_MENTIONS` | `false` | One startup only: convert saved `all` preferences to `mentions`; reversible per room |
 | `ROCKETR_BATCH_MS` | `2000` | Burst window per room and thread; `0` pushes every message on its own |

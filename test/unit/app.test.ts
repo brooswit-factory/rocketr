@@ -21,7 +21,7 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "rocketr-att-"));
   const cfg: Config = {
    attachmentDir: dir, attachmentMaxBytes: 1024,
-    url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+    url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
     accounts: [{ name: "claude", userId: "bot1", token: "tok" }, { name: "lead", userId: "bot2", token: "tok2" }],
   };
   presenceStates.clear();
@@ -246,7 +246,7 @@ describe("accounts", () => {
 
   test("an opt-in default account serves a client that names none, and still refuses a wrong name", async () => {
     const single = await createRocketr({
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [{ name: "claude", userId: "bot1", token: "tok" }], defaultAccount: "claude",
     }, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
     const url = `http://127.0.0.1:${(await single.listen()).port}`;
@@ -309,13 +309,13 @@ describe("accounts", () => {
   });
 
   test("an account whose token signs in as someone else is never served under the name it claims: if it's the ONLY configured account, zero accounts would be served, so startup still exits", async () => {
-    const bad: Config = { attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
+    const bad: Config = { attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
     await expect(createRocketr(bad)).rejects.toThrow('"claude": signs in as @lead, not @claude');
   });
 
   test("the same drifted account is excluded, not fatal, when another account is healthy: blast radius changed, the guarantee didn't", async () => {
     const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
     };
     const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
@@ -335,7 +335,7 @@ describe("accounts", () => {
 
   test("multi-account drift: healthy accounts come up and the process does not throw; a 401 account is excluded the same way as a username mismatch", async () => {
     const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [
         { name: "claude", userId: "bot1", token: "tok" }, // healthy
         { name: "lead", userId: "bot2", token: "tok2" }, // healthy
@@ -356,7 +356,7 @@ describe("accounts", () => {
 
   test("the consolidated startup error names EVERY failed account, not just the first (this would fail against first-failure-only behavior)", async () => {
     const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [
         { name: "claude", userId: "bot1", token: "tok" },
         { name: "renamed", userId: "bot2", token: "tok2" },
@@ -381,7 +381,7 @@ describe("accounts", () => {
 
   test("when every configured account fails, createRocketr rejects with one message naming all of them", async () => {
     const allBad: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [{ name: "renamed", userId: "bot2", token: "tok2" }, { name: "ghost", userId: "bot3", token: "nope" }],
     };
     let err: Error | undefined;
@@ -420,7 +420,7 @@ describe("web app", () => {
 
   test("snapshot names excluded accounts and why, so a partial outage isn't invisible in the web UI", async () => {
     const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
     };
     const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
@@ -517,5 +517,135 @@ describe("download_attachment", () => {
     const before = rcServer.fileRequests.length;
     await fails({ message_id: m._id }, /not found/i, LEAD);
     expect(rcServer.fileRequests.length).toBe(before);
+  });
+});
+
+describe("client secret auth", () => {
+  const SECRET = "s".repeat(32);
+  const RC_TOKEN = "tok"; // same as the fixture account's Rocket.Chat token, below
+
+  /** A fresh Rocketr against the shared fake Rocket.Chat, so each test picks its own secrets/host/flags. */
+  const spin = async (cfg: Partial<Config> = {}, deps: Parameters<typeof createRocketr>[1] = {}) => {
+    const full: Config = {
+      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all",
+      migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
+      allowUnauthenticatedLoopback: false,
+      accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN }],
+      ...cfg,
+    };
+    const rr = await createRocketr(full, { presence: () => ({ setListening: () => {}, stop: () => {} }), ...deps });
+    const url = `http://127.0.0.1:${(await rr.listen()).port}`;
+    return { rr, url };
+  };
+
+  test("the correct bearer is accepted; a wrong or missing one is refused", async () => {
+    const { rr, url } = await spin({ accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] });
+    try {
+      const good = await FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${SECRET}` } });
+      expect((await good.callTool("whoami")).username).toBe("claude");
+      await good.disconnect();
+
+      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: "Bearer " + "w".repeat(32) } })).rejects.toThrow();
+      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE } })).rejects.toThrow(); // no Authorization at all
+    } finally { await rr.stop(); }
+  });
+
+  test("the Rocket.Chat token is never accepted as a client secret", async () => {
+    const { rr, url } = await spin({ accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] });
+    try {
+      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${RC_TOKEN}` } })).rejects.toThrow();
+    } finally { await rr.stop(); }
+  });
+
+  test("an account with no secret is refused unless the transition flag is on, and only while loopback-bound", async () => {
+    { // no secret, flag off (the secure-by-default end state): refused
+      const { rr, url } = await spin({ allowUnauthenticatedLoopback: false });
+      try { await expect(FakeConnection.connect(url, { headers: { ...CLAUDE } })).rejects.toThrow(); } finally { await rr.stop(); }
+    }
+    { // no secret, flag on, loopback-bound: allowed, and warns naming the account
+      const { rr, url } = await spin({ allowUnauthenticatedLoopback: true });
+      try {
+        const c = await FakeConnection.connect(url, { headers: { ...CLAUDE } });
+        expect((await c.callTool("whoami")).username).toBe("claude");
+        await c.disconnect();
+        const warned = rr.activity.snapshot().events.some((e) => e.type === "log" && e.message.includes("@claude") && e.message.includes("ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK"));
+        expect(warned).toBe(true);
+      } finally { await rr.stop(); }
+    }
+  });
+
+  test("a non-loopback bind refuses to start unless every configured account has a secret", async () => {
+    await expect(spin({ host: "0.0.0.0", allowUnauthenticatedLoopback: true })).rejects.toThrow(/client secret/);
+    const { rr } = await spin({ host: "0.0.0.0", accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] });
+    await rr.stop(); // every account secured: starts fine even though the bind isn't loopback
+  });
+
+  test("a locked-out source IP is refused outright, even presenting the correct secret", async () => {
+    const { rr, url } = await spin(
+      { accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] },
+      { authRateLimit: { maxFailures: 2, windowMs: 60_000, lockoutMs: 60_000 } },
+    );
+    try {
+      for (let i = 0; i < 2; i++) await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: "Bearer " + "w".repeat(32) } })).rejects.toThrow();
+      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${SECRET}` } })).rejects.toThrow();
+    } finally { await rr.stop(); }
+  });
+
+  test("a refused connection creates no session, presence, or queue effect", async () => {
+    let listened: boolean | undefined;
+    const { rr, url } = await spin(
+      { accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] },
+      { presence: () => ({ setListening: (v: boolean) => { listened = v; }, stop: () => {} }) },
+    );
+    try {
+      await expect(FakeConnection.connect(url, {
+        headers: { ...CLAUDE, ...ON, authorization: "Bearer " + "w".repeat(32) },
+      })).rejects.toThrow();
+      expect(listened).toBeUndefined(); // setListening was never called for a session that never registered
+      expect(rr.activity.snapshot().events.some((e) => e.type === "connect")).toBe(false);
+      rcServer.post("dm-boss", "boss", "while refused");
+      await Bun.sleep(100);
+      expect(rr.pending.length).toBe(1); // queued normally, as if nobody is listening — unaffected by the refusal
+    } finally { await rr.stop(); }
+  });
+
+  test("secrets never appear in captured log output", async () => {
+    const { rr, url } = await spin({ accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] });
+    try {
+      const good = await FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${SECRET}` } });
+      await good.callTool("whoami");
+      await good.disconnect();
+      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: "Bearer " + "w".repeat(32) } })).rejects.toThrow();
+      const dump = JSON.stringify(rr.activity.snapshot());
+      expect(dump).not.toContain(SECRET);
+      expect(dump).not.toContain(RC_TOKEN);
+    } finally { await rr.stop(); }
+  });
+
+  describe("observer app loopback guard", () => {
+    test("a non-loopback source is refused regardless of client secrets", async () => {
+      const { rr, url } = await spin(
+        { accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] },
+        { requestIP: () => "203.0.113.5" },
+      );
+      try {
+        for (const path of ["/", "/api/snapshot", "/api/stream"]) {
+          const res = await fetch(url + path);
+          expect(res.status).toBe(403);
+        }
+        // the MCP endpoint's own bearer auth is unaffected by this fake remote address
+        const c = await FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${SECRET}` } });
+        expect((await c.callTool("whoami")).username).toBe("claude");
+        await c.disconnect();
+      } finally { await rr.stop(); }
+    });
+
+    test("a loopback source still sees the observer app", async () => {
+      const { rr, url } = await spin({ allowUnauthenticatedLoopback: true });
+      try {
+        expect((await fetch(url + "/")).status).toBe(200);
+        expect((await fetch(url + "/api/snapshot")).status).toBe(200);
+      } finally { await rr.stop(); }
+    });
   });
 });

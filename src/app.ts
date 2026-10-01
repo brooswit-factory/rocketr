@@ -7,6 +7,7 @@ import { Activity } from "./activity.js";
 import { buildTools, instrument } from "./tools.js";
 import { Presence } from "./presence.js";
 import { page } from "./web.js";
+import { createAuthenticator, isLoopbackAddress, isLoopbackHost, type RateLimitOptions } from "./auth.js";
 
 export const VERSION = "0.3.0";
 /**
@@ -69,9 +70,23 @@ export interface Rocketr {
   stop(): Promise<void>;
 }
 
-export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch; presence?: (options: ConstructorParameters<typeof Presence>[0]) => Pick<Presence, "setListening" | "stop"> } = {}): Promise<Rocketr> {
+export async function createRocketr(cfg: Config, deps: {
+  fetch?: typeof fetch;
+  presence?: (options: ConstructorParameters<typeof Presence>[0]) => Pick<Presence, "setListening" | "stop">;
+  /** Source address of an incoming request, for rate limiting and the observer app's loopback guard. Default: the real peer via Bun. */
+  requestIP?: (req: Request) => string | undefined;
+  authRateLimit?: RateLimitOptions;
+} = {}): Promise<Rocketr> {
   const activity = new Activity();
   const log = (message: string) => { console.error(`rocketr: ${message}`); activity.record({ type: "log", message }); };
+
+  // Secure by default: enforced here too (not just in loadConfig) so a Config built directly can't skip it.
+  if (!isLoopbackHost(cfg.host)) {
+    const bare = cfg.accounts.filter((a) => !a.clientSecret).map((a) => a.name);
+    if (bare.length) {
+      throw new Error(`rocketr: host "${cfg.host}" is not loopback, but account(s) without a client secret would be reachable unauthenticated: ${bare.map((n) => `"${n}"`).join(", ")}`);
+    }
+  }
 
   const accounts = new Map<string, Account>();
   const pending: Pending[] = [];
@@ -151,11 +166,31 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch; p
     return a;
   };
 
+  // `app` is assigned below (Elysia needs the thatch plugin to exist first) but these closures are only
+  // ever called per-request, long after that assignment — by then the capture is live, not a TDZ read.
+  const requestIP: (req: Request) => string | undefined = deps.requestIP ?? ((req) => app.server?.requestIP(req)?.address ?? undefined);
+  const secretOf = new Map(cfg.accounts.map((a) => [a.name, a.clientSecret] as const));
+  const loopbackBind = isLoopbackHost(cfg.host);
+  const authenticate = createAuthenticator({
+    known: (name) => accounts.has(name),
+    secretOf: (name) => secretOf.get(name),
+    loopbackBind,
+    allowUnauthenticatedLoopback: cfg.allowUnauthenticatedLoopback,
+    requestIP,
+    onUnauthenticatedLoopback: (name) => log(`@${name}: connected with no client credential (ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK) — set ROCKETR_ACCOUNT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_CLIENT_SECRET to require one`),
+    ...(deps.authRateLimit ? { rateLimit: deps.authRateLimit } : {}),
+  });
+  /** The observer app (/, /api/snapshot, /api/stream) has no per-account auth — it shows every account's
+   * activity, including message content — so it stays loopback-only regardless of client secrets or ROCKETR_HOST. */
+  const observerGuard = (req: Request): Response | null => isLoopbackAddress(requestIP(req))
+    ? null
+    : new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: { "content-type": "application/json" } });
+
   const { plugin, mcp } = thatch({
     serverInfo: { name: "rocketr", version: VERSION },
     // No fallback account unless ROCKETR_DEFAULT_ACCOUNT opts a single-account bridge in: a client that
     // doesn't name a known one is refused at connect.
-    auth: (req) => accounts.has(nameOf(req.headers.get(ACCOUNT_HEADER))),
+    auth: (req) => authenticate(req, nameOf(req.headers.get(ACCOUNT_HEADER))),
     tools: instrument(buildTools(accountOf, cfg.url, cfg.defaultNotifications, (account, roomId, level) => {
       if (level !== "nothing") return;
       for (const item of [...pending]) {
@@ -231,10 +266,10 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch; p
     accounts.set(self.username, { rc, self, watcher });
   }
 
-  const app = new Elysia()
+  const app: AnyElysia = new Elysia()
     .use(plugin)
-    .get("/", () => new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } }))
-    .get("/api/snapshot", () => ({
+    .get("/", ({ request }) => observerGuard(request) ?? new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } }))
+    .get("/api/snapshot", ({ request }) => observerGuard(request) ?? ({
       accounts: [...accounts.values()].map((a) => ({ id: a.self._id, username: a.self.username })),
       // So a partial outage never reads as "all healthy": named explicitly, not just absent from `accounts`.
       excludedAccounts: failures,
@@ -249,6 +284,8 @@ export async function createRocketr(cfg: Config, deps: { fetch?: typeof fetch; p
       ...activity.snapshot(),
     }))
     .get("/api/stream", ({ request }) => {
+      const blocked = observerGuard(request);
+      if (blocked) return blocked;
       let off = () => {};
       const stream = new ReadableStream<string>({
         start(ctrl) {

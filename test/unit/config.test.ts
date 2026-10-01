@@ -23,6 +23,7 @@ describe("loadConfig", () => {
       accounts: [{ name: "claude", userId: "u1", token: "t1" }, { name: "rocketr-lead", userId: "u2", token: "t2" }],
       defaultNotifications: "mentions", migrateLegacyAllToMentions: false, batchMs: 2000, pollMs: 3000, host: "127.0.0.1", port: 8790,
       attachmentDir: join(homedir(), ".local", "share", "rocketr", "attachments"), attachmentMaxBytes: 25 * 1024 * 1024,
+      allowUnauthenticatedLoopback: false,
     });
   });
 
@@ -73,5 +74,46 @@ describe("loadConfig", () => {
 
   test("rejects a non-integer number", () => {
     expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_POLL_MS: "soon" })).toThrow("ROCKETR_POLL_MS");
+  });
+
+  describe("per-account client secret", () => {
+    const SECRET = "x".repeat(32);
+
+    test("optional: accounts default to no client secret and the transition flag defaults off", () => {
+      const c = loadConfig({ ROCKETR_ENV_FILE: file(base) });
+      expect(c.accounts.every((a) => a.clientSecret === undefined)).toBe(true);
+      expect(c.allowUnauthenticatedLoopback).toBe(false);
+    });
+
+    test("read per account, by the same name mangling as USER_ID/TOKEN", () => {
+      const c = loadConfig({ ROCKETR_ENV_FILE: file(base + `ROCKETR_ACCOUNT_CLAUDE_CLIENT_SECRET=${SECRET}\n`) });
+      expect(c.accounts.find((a) => a.name === "claude")?.clientSecret).toBe(SECRET);
+      expect(c.accounts.find((a) => a.name === "rocketr-lead")?.clientSecret).toBeUndefined();
+    });
+
+    test("ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK is a plain boolean", () => {
+      expect(loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK: "true" }).allowUnauthenticatedLoopback).toBe(true);
+      expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK: "yes" })).toThrow("ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK");
+    });
+
+    test("rejects a secret shorter than the minimum", () => {
+      expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base + "ROCKETR_ACCOUNT_CLAUDE_CLIENT_SECRET=tooshort\n") }))
+        .toThrow("ROCKETR_ACCOUNT_CLAUDE_CLIENT_SECRET is 8 chars, must be at least 32");
+    });
+
+    test("a non-loopback ROCKETR_HOST refuses to start unless every account has a secret", () => {
+      expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_HOST: "0.0.0.0" }))
+        .toThrow('account(s) without a client secret would be reachable unauthenticated: "claude", "rocketr-lead"');
+      // one secret configured, one missing: still refused, naming only the one still missing
+      expect(() => loadConfig({ ROCKETR_ENV_FILE: file(base + `ROCKETR_ACCOUNT_CLAUDE_CLIENT_SECRET=${SECRET}\n`), ROCKETR_HOST: "0.0.0.0" }))
+        .toThrow('"rocketr-lead"');
+      // every account secured: a non-loopback bind is fine
+      const secured = base + `ROCKETR_ACCOUNT_CLAUDE_CLIENT_SECRET=${SECRET}\nROCKETR_ACCOUNT_ROCKETR_LEAD_CLIENT_SECRET=${SECRET}\n`;
+      expect(loadConfig({ ROCKETR_ENV_FILE: file(secured), ROCKETR_HOST: "0.0.0.0" }).host).toBe("0.0.0.0");
+    });
+
+    test("localhost counts as loopback for the same bind guard", () => {
+      expect(loadConfig({ ROCKETR_ENV_FILE: file(base), ROCKETR_HOST: "localhost" }).host).toBe("localhost");
+    });
   });
 });
