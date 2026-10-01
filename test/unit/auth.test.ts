@@ -251,12 +251,35 @@ describe("createAuthenticator", () => {
       expect(auth(req({ authorization: `Bearer ${secret}` }), "claude")).toBe(true); // claude's own key is untouched
     });
 
-    test("a missing secret under the transition flag is never counted as a failure, so it cannot lock anyone out", () => {
-      const auth = createAuthenticator({
-        ...base, secretOf: () => undefined, loopbackBind: true, allowUnauthenticatedLoopback: false,
-        rateLimit: { maxFailures: 1, windowMs: 10_000, lockoutMs: 10_000 },
-      });
-      for (let i = 0; i < 5; i++) expect(auth(req(), "claude")).toBe(false); // refused every time, never locked
+    test("a missing secret is never counted as a failure, so it cannot lock anyone out — neither branch that produces it", () => {
+      // branch 1: no secret configured for the account, and the transition flag is off (so the
+      // unauthenticated-loopback path doesn't apply either) — refused, but not for a credential reason.
+      {
+        const log: Array<{ reason: string }> = [];
+        const auth = createAuthenticator({
+          ...base, onRefused: (info) => log.push(info), secretOf: () => undefined, loopbackBind: true, allowUnauthenticatedLoopback: false,
+          rateLimit: { maxFailures: 1, windowMs: 10_000, lockoutMs: 10_000 },
+        });
+        for (let i = 0; i < 5; i++) expect(auth(req(), "claude")).toBe(false);
+        // every one of those 5 refusals must be its own missing-secret reason, never "locked" —
+        // with maxFailures: 1, a single counted failure would lock the key and turn every
+        // subsequent refusal's reason into "locked" instead.
+        expect(log.map((l) => l.reason)).toEqual(Array(5).fill("missing-secret"));
+      }
+      // branch 2: a secret IS configured for the account, but the client presents no Authorization
+      // header at all (as opposed to a wrong one, which is bad-secret and DOES count).
+      {
+        const secret = "s".repeat(32);
+        const log: Array<{ reason: string }> = [];
+        const auth = createAuthenticator({
+          ...base, onRefused: (info) => log.push(info), secretOf: () => secret, loopbackBind: true, allowUnauthenticatedLoopback: true,
+          rateLimit: { maxFailures: 1, windowMs: 10_000, lockoutMs: 10_000 },
+        });
+        for (let i = 0; i < 5; i++) expect(auth(req(), "claude")).toBe(false);
+        expect(log.map((l) => l.reason)).toEqual(Array(5).fill("missing-secret"));
+        // and the key was truly never touched: the correct credential still succeeds afterwards.
+        expect(auth(req({ authorization: `Bearer ${secret}` }), "claude")).toBe(true);
+      }
     });
 
     test("a success resets the key, clearing any accumulated failures", () => {
