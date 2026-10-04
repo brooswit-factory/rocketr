@@ -299,11 +299,25 @@ network or DNS traffic.
   for telling Claude how to reply. rocketr puts that guidance in `send_message`'s
   description instead.
 - Polling, not Rocket.Chat's realtime API: a push lands within one poll interval (3s floor).
-- A client session does not reconnect by itself after rocketr restarts — Claude Code/thatch have
-  no automatic reconnect today, so a restart still deafens sessions until each one reconnects on
-  its own (manually, or whenever its own supervisor next restarts it). `x-rocketr-lookback-sec`
-  recovers recent history once a session does reconnect, but does not make the reconnect itself
-  happen sooner.
+- **Restarting any rocketr instance deafens idle sessions.** Observed 2026-10-04 on codey (FACTORY-644):
+  after a restart, the MCP connections all reappeared in `/api/snapshot` within seconds, but a test
+  @-mention reached only the sessions that were mid-turn; the idle ones (7 agents) stayed deaf until
+  poked. A live connection is therefore NOT proof of push delivery. Claude Code/thatch do not
+  re-subscribe an idle session's channel stream after the server restarts. `x-rocketr-lookback-sec`
+  replays recent history once a session's stream does come back, but it does not bring it back.
+
+  What this design can and cannot do about it:
+  - **Fewer restarts (yes).** There is no registry or config file to reload, so adding a client,
+    changing a client's options or rotating a token never needs a restart: a restart is only ever a
+    code deploy. Plan restarts as rare, announced events.
+  - **A keepalive the client sees (no, not by itself).** The proxy cannot force a client to reopen
+    its stream; the client has to notice the drop and act, and an idle one does not. Nothing the
+    server sends helps a client that is not listening.
+  - **After ANY restart, check delivery, don't trust the connection list.** Post a test @-mention to
+    each affected agent and read each agent's own transcript for it; poke any that missed it (inject a
+    turn so it re-subscribes) and re-check. The cutover plan (FACTORY-655) does this after every batch.
+  - A fix belongs on the client side (re-subscribe on stream loss), which is thatch/Claude Code work,
+    not rocketr's.
 
 ### Downloading attachments
 
