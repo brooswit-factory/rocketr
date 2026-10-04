@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { NOTIFY_LEVELS, type NotifyLevel } from "./rocketchat.js";
 import { isLoopbackHost } from "./auth.js";
+import { parseAttachmentTypes } from "./attachment-types.js";
 
 /** Shortest client secret `loadConfig` accepts. Below this, a startup check in `createRocketr` also refuses. */
 export const MIN_CLIENT_SECRET_LENGTH = 32;
@@ -42,6 +43,8 @@ export interface Config {
   attachmentDir: string;
   /** Largest attachment `download_attachment` will save. */
   attachmentMaxBytes: number;
+  /** MIME allowlist `download_attachment` enforces; exact types or `type/*` wildcards. */
+  attachmentTypes: string[];
   host: string;
   port: number;
   /**
@@ -141,6 +144,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     pollMs: int("ROCKETR_POLL_MS", 3000),
     attachmentDir: get("ROCKETR_ATTACHMENT_DIR") || join(homedir(), ".local", "share", "rocketr", "attachments"),
     attachmentMaxBytes: int("ROCKETR_ATTACHMENT_MAX_BYTES", 25 * 1024 * 1024),
+    attachmentTypes: parseAttachmentTypes(get("ROCKETR_ATTACHMENT_TYPES") || undefined),
     host, port: int("ROCKETR_PORT", 8790),
     allowUnauthenticatedLoopback,
   };

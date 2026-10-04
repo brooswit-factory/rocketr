@@ -197,7 +197,7 @@ export async function createRocketr(cfg: Config, deps: {
       for (const item of [...pending]) {
         if (item.account === account && item.frame.meta.room_id === roomId) pending.splice(pending.indexOf(item), 1);
       }
-    }, { dir: cfg.attachmentDir, maxBytes: cfg.attachmentMaxBytes }), activity),
+    }, { dir: cfg.attachmentDir, maxBytes: cfg.attachmentMaxBytes, allowedTypes: cfg.attachmentTypes }), activity),
   });
   const syncPresence = (c: Connection) => {
     const account = nameOf(c.headers[ACCOUNT_HEADER]);

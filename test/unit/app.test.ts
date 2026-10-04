@@ -6,6 +6,7 @@ import { FakeConnection } from "@brooswit/thatch/testing";
 import { createRocketr, type Rocketr } from "../../src/app.js";
 import type { Config } from "../../src/config.js";
 import { FakeRocketChat } from "./fake-rocketchat.js";
+import { DEFAULT_ATTACHMENT_TYPES } from "../../src/attachment-types.js";
 
 let rcServer: FakeRocketChat, r: Rocketr, base: string, dir: string;
 const conns: FakeConnection[] = [];
@@ -20,7 +21,7 @@ beforeEach(async () => {
   rcServer = new FakeRocketChat().start();
   dir = await mkdtemp(join(tmpdir(), "rocketr-att-"));
   const cfg: Config = {
-   attachmentDir: dir, attachmentMaxBytes: 1024,
+   attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES,
     url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
     accounts: [{ name: "claude", userId: "bot1", token: "tok" }, { name: "lead", userId: "bot2", token: "tok2" }],
   };
@@ -246,7 +247,7 @@ describe("accounts", () => {
 
   test("an opt-in default account serves a client that names none, and still refuses a wrong name", async () => {
     const single = await createRocketr({
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
+      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [{ name: "claude", userId: "bot1", token: "tok" }], defaultAccount: "claude",
     }, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
     const url = `http://127.0.0.1:${(await single.listen()).port}`;
@@ -309,13 +310,13 @@ describe("accounts", () => {
   });
 
   test("an account whose token signs in as someone else is never served under the name it claims: if it's the ONLY configured account, zero accounts would be served, so startup still exits", async () => {
-    const bad: Config = { attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
+    const bad: Config = { attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
     await expect(createRocketr(bad)).rejects.toThrow('"claude": signs in as @lead, not @claude');
   });
 
   test("the same drifted account is excluded, not fatal, when another account is healthy: blast radius changed, the guarantee didn't", async () => {
     const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
+      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
     };
     const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
@@ -335,7 +336,7 @@ describe("accounts", () => {
 
   test("multi-account drift: healthy accounts come up and the process does not throw; a 401 account is excluded the same way as a username mismatch", async () => {
     const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
+      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [
         { name: "claude", userId: "bot1", token: "tok" }, // healthy
         { name: "lead", userId: "bot2", token: "tok2" }, // healthy
@@ -356,7 +357,7 @@ describe("accounts", () => {
 
   test("the consolidated startup error names EVERY failed account, not just the first (this would fail against first-failure-only behavior)", async () => {
     const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
+      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [
         { name: "claude", userId: "bot1", token: "tok" },
         { name: "renamed", userId: "bot2", token: "tok2" },
@@ -381,7 +382,7 @@ describe("accounts", () => {
 
   test("when every configured account fails, createRocketr rejects with one message naming all of them", async () => {
     const allBad: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
+      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [{ name: "renamed", userId: "bot2", token: "tok2" }, { name: "ghost", userId: "bot3", token: "nope" }],
     };
     let err: Error | undefined;
@@ -420,7 +421,7 @@ describe("web app", () => {
 
   test("snapshot names excluded accounts and why, so a partial outage isn't invisible in the web UI", async () => {
     const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
+      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
       accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
     };
     const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
@@ -455,10 +456,21 @@ describe("download_attachment", () => {
   const fails = (args: Record<string, unknown>, msg: string | RegExp, headers: Record<string, string> = {}) =>
     expect(call(args, headers)).rejects.toThrow(msg);
 
-  test("saves an allowed file under the configured dir and reports path, size and type", async () => {
+  test("remote mode (default) returns base64 bytes, using the server-returned message id", async () => {
     rcServer.files.set("/file-upload/f1/shot.png", { type: "image/png", body: PNG });
     const m = withAttachment("shot.png", "/file-upload/f1/shot.png");
-    const saved = (await call({ message_id: m._id })) as any;
+    const got = (await call({ message_id: m._id })) as any;
+    expect(got.message_id).toBe(m._id);
+    expect(got.mime_type).toBe("image/png");
+    expect(got.size).toBe(PNG.length);
+    expect(Buffer.from(got.data_base64, "base64")).toEqual(PNG);
+    expect(got.path).toBeUndefined();
+  });
+
+  test("local mode (explicit opt-in) saves under the configured dir and reports path, size and type", async () => {
+    rcServer.files.set("/file-upload/f1b/shot.png", { type: "image/png", body: PNG });
+    const m = withAttachment("shot.png", "/file-upload/f1b/shot.png");
+    const saved = (await call({ message_id: m._id, mode: "local" })) as any;
     expect(saved.path).toContain(`${m._id}-0-shot.png`);
     expect(saved.size).toBe(PNG.length);
     expect(saved.mime_type).toBe("image/png");
@@ -466,10 +478,10 @@ describe("download_attachment", () => {
     expect(saved.path.startsWith(dir)).toBe(true);
   });
 
-  test("refuses a disallowed type and writes nothing", async () => {
+  test("refuses a disallowed type and writes nothing (local mode)", async () => {
     rcServer.files.set("/file-upload/f2/x.exe", { type: "application/x-msdownload", body: Buffer.from("MZ") });
     const m = withAttachment("x.exe", "/file-upload/f2/x.exe");
-    await fails({ message_id: m._id }, "not allowed");
+    await fails({ message_id: m._id, mode: "local" }, "not allowed");
     expect(await readdir(dir)).toEqual([]);
   });
 
@@ -479,23 +491,23 @@ describe("download_attachment", () => {
     rcServer.files.set("/file-upload/f4/b.png", { type: "image/png", body: big, lengthHeader: false });
     for (const [id, link] of [["a", "/file-upload/f3/a.png"], ["b", "/file-upload/f4/b.png"]] as const) {
       const m = withAttachment(`${id}.png`, link);
-      await fails({ message_id: m._id }, /limit/);
+      await fails({ message_id: m._id, mode: "local" }, /limit/);
     }
     expect(await readdir(dir)).toEqual([]);
   });
 
-  test("a traversal filename stays inside the dir", async () => {
+  test("a traversal filename stays inside the dir (local mode), and the tmp name is unique per download", async () => {
     rcServer.files.set("/file-upload/f5/evil", { type: "text/plain", body: Buffer.from("hi") });
     const m = withAttachment("../../../etc/cron.d/evil", "/file-upload/f5/evil");
-    const saved = (await call({ message_id: m._id })) as any;
+    const saved = (await call({ message_id: m._id, mode: "local" })) as any;
     expect(saved.path.startsWith(join(dir, "claude") + "/")).toBe(true);
     expect(saved.path).not.toContain("..");
   });
 
-  test("two messages with the same filename do not overwrite each other", async () => {
+  test("two messages with the same filename do not overwrite each other (local mode)", async () => {
     rcServer.files.set("/file-upload/f6/a.png", { type: "image/png", body: PNG });
     const a = withAttachment("same.png", "/file-upload/f6/a.png"), b = withAttachment("same.png", "/file-upload/f6/a.png");
-    await call({ message_id: a._id }); await call({ message_id: b._id });
+    await call({ message_id: a._id, mode: "local" }); await call({ message_id: b._id, mode: "local" });
     expect((await readdir(join(dir, "claude"))).length).toBe(2);
   });
 
@@ -518,6 +530,25 @@ describe("download_attachment", () => {
     await fails({ message_id: m._id }, /not found/i, LEAD);
     expect(rcServer.fileRequests.length).toBe(before);
   });
+
+  test("ROCKETR_ATTACHMENT_TYPES overrides the default allowlist (FACTORY-593 nit 2)", async () => {
+    rcServer.files.set("/file-upload/f9/data.json", { type: "application/json", body: Buffer.from("{}") });
+    const m = withAttachment("data.json", "/file-upload/f9/data.json");
+    // default allowlist refuses JSON
+    await fails({ message_id: m._id, mode: "local" }, "not allowed");
+
+    const custom = await createRocketr(
+      { attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: ["application/json"], url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true, accounts: [{ name: "claude", userId: "bot1", token: "tok" }] },
+      { presence: () => ({ setListening: () => {}, stop: () => {} }) },
+    );
+    try {
+      const url = `http://127.0.0.1:${(await custom.listen()).port}`;
+      const c = await FakeConnection.connect(url, { headers: { ...CLAUDE } });
+      const got = (await c.callTool("download_attachment", { message_id: m._id, mode: "local" })) as any;
+      expect(got.mime_type).toBe("application/json");
+      await c.disconnect();
+    } finally { await custom.stop(); }
+  });
 });
 
 describe("client secret auth", () => {
@@ -527,7 +558,7 @@ describe("client secret auth", () => {
   /** A fresh Rocketr against the shared fake Rocket.Chat, so each test picks its own secrets/host/flags. */
   const spin = async (cfg: Partial<Config> = {}, deps: Parameters<typeof createRocketr>[1] = {}) => {
     const full: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, url: rcServer.url, defaultNotifications: "all",
+      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all",
       migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
       allowUnauthenticatedLoopback: false,
       accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN }],

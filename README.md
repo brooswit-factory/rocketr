@@ -230,19 +230,37 @@ and the web app are all exercised over HTTP.
 ### Downloading attachments
 
 `read_messages` lists a message's attachments (`index`, `title`, `type`, `size`). `download_attachment` takes a
-`message_id` (and an `index`, default 0) and saves that file on the machine rocketr runs on, returning its absolute
-`path`, `mime_type` and `size`. It uses the calling account's own token and the existing REST routes, so an
-account can only fetch attachments of messages it can already read; no server change is needed.
+`message_id` (and an `index`, default 0) and fetches that file using the calling account's own token and the
+existing REST routes, so an account can only fetch attachments of messages it can already read; no server change
+is needed.
+
+Two modes, chosen with `mode`:
+
+- **`remote` (default).** Returns the file's bytes directly in the tool result, base64-encoded. This is the only
+  mode useful when the agent runs on a different machine from rocketr — which, now that rocketr is a shared proxy,
+  is every agent. Capped at the lower of `ROCKETR_ATTACHMENT_MAX_BYTES` and a fixed 10 MiB (base64 inflates that to
+  ~13.3 MiB in the result, comfortably under typical MCP result-size limits). Nothing is written to rocketr's own
+  disk in this mode.
+- **`local`.** Saves the file to rocketr's own disk and returns its absolute `path` instead — only useful when the
+  calling agent runs on the same host as rocketr and can read that path itself. Explicit opt-in; never the default.
+
+Both modes share the same safety properties:
 
 - Only links under the configured server's own `/file-upload/` or `/ufs/` routes are fetched (no redirects, no other host).
-- Allowed types: PNG, JPEG, GIF, WebP, audio (`audio/*`), PDF and plain text. Anything else is refused.
+- Allowed types, by default: PNG, JPEG, GIF, WebP, audio (`audio/*`), PDF and plain text. Anything else is refused.
+  Configurable via `ROCKETR_ATTACHMENT_TYPES` (comma-separated exact MIME types or `type/*` wildcards) — note that
+  `Content-Type` is set by whoever uploaded the file, not sniffed from its bytes, so this allowlist is a policy
+  filter on the declared type, not a guarantee about the actual content.
 - The size cap is enforced against the declared size, the `Content-Length` and the bytes actually received.
-- Files are saved as `<dir>/<account>/<message id>-<index>-<sanitised title>`, so one message's file can never replace another's.
+- `local` mode's files are saved as `<dir>/<account>/<message id>-<index>-<sanitised title>` (the message id always
+  comes from the server's own response, never the raw tool input), with a unique temp filename per download, so
+  concurrent downloads and same-named attachments can never collide or overwrite each other.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ROCKETR_ATTACHMENT_DIR` | `~/.local/share/rocketr/attachments` | Where files are saved (one folder per account, mode 0700) |
-| `ROCKETR_ATTACHMENT_MAX_BYTES` | `26214400` (25 MiB) | Largest file saved |
+| `ROCKETR_ATTACHMENT_DIR` | `~/.local/share/rocketr/attachments` | Where `local` mode saves files (one folder per account, mode 0700) |
+| `ROCKETR_ATTACHMENT_MAX_BYTES` | `26214400` (25 MiB) | Largest file fetched, in either mode (`remote` also clamps to the lower 10 MiB cap above) |
+| `ROCKETR_ATTACHMENT_TYPES` | PNG/JPEG/GIF/WebP, `audio/*`, PDF, plain text | MIME allowlist; comma-separated exact types or `type/*` wildcards |
 
 ### Posting screenshots
 

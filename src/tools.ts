@@ -4,6 +4,17 @@ import { z, type Connection, type ToolDef } from "@brooswit/thatch";
 import { NOTIFY_LEVELS, type Attachment, type Message, type NotifyLevel, type RocketChat, type Room, type User } from "./rocketchat.js";
 import { levelOf } from "./watcher.js";
 import type { Activity } from "./activity.js";
+import { attachmentAllowed, DEFAULT_ATTACHMENT_TYPES } from "./attachment-types.js";
+
+export { attachmentAllowed, DEFAULT_ATTACHMENT_TYPES as ATTACHMENT_TYPES } from "./attachment-types.js";
+
+/**
+ * `download_attachment`'s "remote" mode returns base64 bytes in the MCP tool result rather than
+ * saving to this machine's disk — the only mode useful to an agent that runs on a different
+ * machine from rocketr. Capped well under typical MCP result-size limits even after base64's ~4/3
+ * inflation (10 MiB raw → ~13.3 MiB encoded).
+ */
+export const REMOTE_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 
 /** Infers handler args from the zod shape, then erases to the registry's type. */
 const tool = <S extends z.ZodRawShape>(def: ToolDef<S>): ToolDef<any> => def as ToolDef<any>;
@@ -14,10 +25,7 @@ const REACTION_GUIDANCE = "Acknowledge each message you read from the operator o
 const ROOM = z.string().min(1).describe('Room: an id (e.g. the room_id from a <channel source="rocketr"> tag), "#channel", or "@username" for a DM');
 const USERNAME = z.string().min(1).describe("Username, without the @");
 
-/** What `download_attachment` will save: images, audio, PDF and plain text. Anything else is refused. */
-export const ATTACHMENT_TYPES = [/^image\/(png|jpeg|gif|webp)$/, /^audio\/[a-z0-9.+-]+$/, /^application\/pdf$/, /^text\/plain$/];
-export const attachmentAllowed = (mime: string) => ATTACHMENT_TYPES.some((re) => re.test(mime));
-export interface AttachmentOptions { dir: string; maxBytes: number }
+export interface AttachmentOptions { dir: string; maxBytes: number; allowedTypes?: string[] }
 
 const attachmentView = (a: Attachment, index: number) => ({
   index, title: a.title ?? null,
@@ -134,26 +142,34 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
     }),
     download_attachment: tool({
       description:
-        "Save a file attached to a Rocket.Chat message to this machine and return its local path. Use the message id from read_messages " +
-        "(its `attachments` list shows what is there). Images (png/jpeg/gif/webp), audio, PDF and plain text only, up to a size cap; " +
-        "files land in a fixed rocketr directory, one folder per account.",
+        "Fetch a file attached to a Rocket.Chat message. Use the message id from read_messages (its `attachments` list shows what is " +
+        "there). Images (png/jpeg/gif/webp), audio, PDF and plain text only, up to a size cap. `mode: \"remote\"` (default) returns the " +
+        "file's bytes directly in the result (base64), capped lower than local saves to stay under typical MCP result-size limits — use " +
+        "this unless your agent runs on the same machine as rocketr. `mode: \"local\"` saves to rocketr's own disk (one folder per " +
+        "account) and returns the absolute path instead — only useful to a same-host agent, since nothing else can read that path.",
       input: {
         message_id: z.string().min(1).describe("The message that carries the attachment"),
         index: z.number().int().min(0).max(49).optional().describe("Which attachment, from the message's attachments list (default 0)"),
+        mode: z.enum(["remote", "local"]).optional().describe('"remote" (default): return base64 bytes in the result. "local": save to rocketr\'s own disk and return the path (same-host agents only).'),
       },
-      handler: async ({ message_id, index = 0 }, c) => {
+      handler: async ({ message_id, index = 0, mode = "remote" }, c) => {
         if (!attachments) throw new Error("Attachment downloads are not configured");
         const { rc, self } = accountOf(c);
         const m = await rc.message(message_id);
         const a = m.attachments?.[index];
         if (!a?.title_link) throw new Error(`Message ${message_id} has no downloadable attachment at index ${index}`);
         const declared = attachmentView(a, index);
-        if (declared.size !== null && declared.size > attachments.maxBytes) throw new Error(`Attachment is ${declared.size} bytes; the limit is ${attachments.maxBytes}`);
+        // Remote mode's bytes travel inside the MCP result, so it clamps to a smaller effective cap
+        // regardless of the configured ROCKETR_ATTACHMENT_MAX_BYTES — see REMOTE_ATTACHMENT_MAX_BYTES.
+        const effectiveMax = mode === "remote" ? Math.min(attachments.maxBytes, REMOTE_ATTACHMENT_MAX_BYTES) : attachments.maxBytes;
+        if (declared.size !== null && declared.size > effectiveMax) throw new Error(`Attachment is ${declared.size} bytes; the limit is ${effectiveMax}`);
         const res = await rc.fetchUpload(a.title_link);
+        // Content-Type is set by whoever uploaded the file, not sniffed from its bytes — this allowlist is a
+        // policy filter on the declared type, not a content-sniffing guarantee about what the bytes actually are.
         const mime = (res.headers.get("content-type") ?? declared.type ?? "").split(";")[0]!.trim().toLowerCase();
-        if (!attachmentAllowed(mime)) throw new Error(`Attachment type "${mime || "unknown"}" is not allowed`);
+        if (!attachmentAllowed(mime, attachments.allowedTypes)) throw new Error(`Attachment type "${mime || "unknown"}" is not allowed`);
         const length = Number(res.headers.get("content-length") ?? 0);
-        if (length > attachments.maxBytes) throw new Error(`Attachment is ${length} bytes; the limit is ${attachments.maxBytes}`);
+        if (length > effectiveMax) throw new Error(`Attachment is ${length} bytes; the limit is ${effectiveMax}`);
         // The size header is advisory: count what actually arrives and stop at the cap.
         const chunks: Uint8Array[] = [];
         let total = 0;
@@ -162,16 +178,21 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
           const { done, value } = await reader.read();
           if (done) break;
           total += value.length;
-          if (total > attachments.maxBytes) { await reader.cancel(); throw new Error(`Attachment exceeds the ${attachments.maxBytes}-byte limit`); }
+          if (total > effectiveMax) { await reader.cancel(); throw new Error(`Attachment exceeds the ${effectiveMax}-byte limit`); }
           chunks.push(value);
+        }
+        // Nit (FACTORY-593 #1): the filename component is the server-returned message id, not the raw tool input.
+        if (mode === "remote") {
+          return { message_id: m._id, index, mime_type: mime, size: total, data_base64: Buffer.concat(chunks.map((ch) => Buffer.from(ch))).toString("base64") };
         }
         const safe = (a.title ?? "attachment").replace(/[^A-Za-z0-9._-]+/g, "_").replace(/\.{2,}/g, "_").replace(/^\.+/, "").slice(-100) || "attachment";
         const dir = join(attachments.dir, self.username.replace(/[^A-Za-z0-9._-]/g, "_"));
         await mkdir(dir, { recursive: true, mode: 0o700 });
-        const path = join(dir, `${message_id}-${index}-${safe}`);
-        const tmp = `${path}.part`;
+        const path = join(dir, `${m._id}-${index}-${safe}`);
+        // Nit (FACTORY-593 #3): a unique tmp name per download, not a shared `.part` two concurrent downloads could collide on.
+        const tmp = `${path}.part-${crypto.randomUUID()}`;
         try { await Bun.write(tmp, new Blob(chunks)); await rename(tmp, path); } catch (e) { await rm(tmp, { force: true }); throw e; }
-        return { path, mime_type: mime, size: total, message_id, index };
+        return { path, mime_type: mime, size: total, message_id: m._id, index };
       },
     }),
     get_notifications: tool({

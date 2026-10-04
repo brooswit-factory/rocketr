@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { loadConfig, parseEnvFile } from "../../src/config.js";
+import { DEFAULT_ATTACHMENT_TYPES } from "../../src/attachment-types.js";
 
 const file = (text: string) => { const p = join(mkdtempSync(join(tmpdir(), "rocketr-")), "secrets.env"); writeFileSync(p, text); return p; };
 
@@ -23,14 +24,16 @@ describe("loadConfig", () => {
       accounts: [{ name: "claude", userId: "u1", token: "t1" }, { name: "rocketr-lead", userId: "u2", token: "t2" }],
       defaultNotifications: "mentions", migrateLegacyAllToMentions: false, batchMs: 2000, pollMs: 3000, host: "127.0.0.1", port: 8790,
       attachmentDir: join(homedir(), ".local", "share", "rocketr", "attachments"), attachmentMaxBytes: 25 * 1024 * 1024,
+      attachmentTypes: DEFAULT_ATTACHMENT_TYPES,
       allowUnauthenticatedLoopback: false,
     });
   });
 
-  test("attachment dir and cap are configurable", () => {
-    const c = loadConfig({ ROCKETR_ENV_FILE: file(base + "ROCKETR_ATTACHMENT_DIR=/srv/att\nROCKETR_ATTACHMENT_MAX_BYTES=1000\n") });
+  test("attachment dir, cap, and allowed types are configurable", () => {
+    const c = loadConfig({ ROCKETR_ENV_FILE: file(base + "ROCKETR_ATTACHMENT_DIR=/srv/att\nROCKETR_ATTACHMENT_MAX_BYTES=1000\nROCKETR_ATTACHMENT_TYPES=text/plain,application/json\n") });
     expect(c.attachmentDir).toBe("/srv/att");
     expect(c.attachmentMaxBytes).toBe(1000);
+    expect(c.attachmentTypes).toEqual(["text/plain", "application/json"]);
   });
 
   test("process env wins over the file", () => {
