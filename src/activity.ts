@@ -21,6 +21,7 @@ export type ActivityEvent = { seq: number; at: number } & (
   | { type: "inbound"; frame: Frame }
   | { type: "push"; agentId: string; messageId: string; delivery: Delivery }
   | { type: "log"; message: string }
+  | { type: "no-channel"; key: string; username: string | null; waiting: number }
 );
 
 type Body<T> = T extends unknown ? Omit<T, "seq" | "at"> : never;

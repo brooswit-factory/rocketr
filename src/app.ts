@@ -40,6 +40,8 @@ const DEFAULT_BACKOFF_MS = 60 * 1000;
 const DEFAULT_ALERT_THRESHOLD_PER_IP = 20_000;
 /** Server-injected only (auth() always overwrites it; a client-sent value for it is never trusted) — carries the resolved client IP from auth() to the "connect" handler, which only sees headers, with no race against concurrent connections. */
 const INTERNAL_IP_HEADER = "x-rocketr-internal-ip";
+/** How often the "no channel-on connection at all" log/event may fire for the same credential key, so the 1s retry loop cannot flood it. */
+const NO_CHANNEL_LOG_INTERVAL_MS = 60 * 1000;
 
 export interface Pending {
   /** Credential key the message was addressed to; only its sessions may receive it. */
@@ -91,6 +93,8 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
   const pending: Pending[] = [];
   const batchers = new Map<string, Batcher>();
   let delivering = Promise.resolve(0);
+  /** Last time (key) got a "no channel-on connection at all" log/event, so deliverOnce's 1s retry loop can't flood it. */
+  const lastNoChannelLogAt = new Map<string, number>();
 
   const adopt = async (session: Session, sub: Subscription) => {
     if (sub.desktopNotifications || sub.disableNotifications !== undefined) return;
@@ -264,23 +268,47 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
    * key. Claude Code accepts a frame on the wire even when the session wasn't started with the
    * channel flag, then drops it silently — so a tools-only session must never count as a delivery.
    */
+  /** Every channel-on connection for the credential key, newest first, so a refusal from the
+   * newest can fall back to an older connection that may still have a live stream. */
   const listening = (key: string) => mcp.connections
     .filter((c) => c.headers["x-rocketr-channel"] === "on" && credentialKey(connectionCredentials(c.headers)) === key)
-    .sort((a, b) => b.connectedAt - a.connectedAt)[0];
+    .sort((a, b) => b.connectedAt - a.connectedAt);
+
+  /** An account with no channel-on connection at all leaves no per-attempt event — log it out loud
+   * instead, at most once a minute per key so the 1s retry loop can't flood it. */
+  const noteNoChannel = (key: string, waiting: number) => {
+    const now = Date.now();
+    const last = lastNoChannelLogAt.get(key);
+    if (last !== undefined && now - last < NO_CHANNEL_LOG_INTERVAL_MS) return;
+    lastNoChannelLogAt.set(key, now);
+    const username = sessions.get(key)?.self.username ?? null;
+    log(`${username ? `@${username}` : key.slice(0, 12)}: no channel-on connection, ${waiting} frame${waiting === 1 ? "" : "s"} waiting`);
+    activity.record({ type: "no-channel", key, username, waiting });
+  };
 
   const deliverOnce = async () => {
     let landed = 0;
     for (const item of [...pending]) {
-      const target = listening(item.key);
-      if (!target) continue;
-      const delivery = await target.send(item.frame);
-      activity.record({ type: "push", agentId: target.id, messageId: item.frame.meta.message_id ?? "", delivery });
-      if (delivery.claim !== "C2") continue;
-      pending.splice(pending.indexOf(item), 1);
-      landed++;
-      const rid = item.frame.meta.room_id;
-      const session = sessions.get(item.key);
-      if (rid && session) await session.rc.markRead(rid).catch((err) => log(`markRead: ${(err as Error).message}`));
+      const targets = listening(item.key);
+      if (!targets.length) {
+        noteNoChannel(item.key, pending.filter((p) => p.key === item.key).length);
+        continue;
+      }
+      for (const target of targets) {
+        const delivery = await target.send(item.frame);
+        activity.record({ type: "push", agentId: target.id, messageId: item.frame.meta.message_id ?? "", delivery });
+        if (delivery.claim === "C2") {
+          pending.splice(pending.indexOf(item), 1);
+          landed++;
+          const rid = item.frame.meta.room_id;
+          const session = sessions.get(item.key);
+          if (rid && session) await session.rc.markRead(rid).catch((err) => log(`markRead: ${(err as Error).message}`));
+          break;
+        }
+        // "bad-meta" is a problem with the frame itself, not this connection — every other
+        // connection would refuse it the same way, so stop trying and leave it pending.
+        if (delivery.reason === "bad-meta") break;
+      }
     }
     return landed;
   };
@@ -302,6 +330,7 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
         username: s.self.username,
         connections: s.refCount,
         health: s.watcher?.health() ?? null,
+        noChannelConnection: listening(s.key).length === 0,
       })),
       version: VERSION,
       pending: pending.length,

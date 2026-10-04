@@ -221,6 +221,59 @@ describe("channel", () => {
   }, 10_000);
 });
 
+describe("delivery fallback across a credential's own connections (FACTORY-644, staffing spec)", () => {
+  test("the newest connection has no open stream, an older one does: the frame lands on the older and is removed from pending", async () => {
+    const older = await connect({ ...ON, "x-agent-name": "older" });
+    await Bun.sleep(80); // let the older connection's notification stream attach
+    await connect({ ...ON, "x-agent-name": "newer" }); // newest by connectedAt; its stream has not attached yet
+    const key = r.sessions()[0]!.key;
+    r.pending.push({ key, frame: { content: "fallback please", meta: { message_id: "fb-1" } } });
+    await r.deliver();
+    expect((await older.nextFrame(2000)).content).toBe("fallback please");
+    expect(r.pending.length).toBe(0);
+  }, 10_000);
+
+  test("every channel-on connection refuses: the frame stays pending, with one push event per attempt", async () => {
+    await connect(ON); // channel-on but its stream has not attached yet: every send refuses
+    const key = r.sessions()[0]!.key;
+    r.pending.push({ key, frame: { content: "nobody home", meta: { message_id: "ref-1" } } });
+    await r.deliver();
+    expect(r.pending.length).toBe(1);
+    const pushes = r.activity.snapshot().events.filter((e) => e.type === "push");
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toMatchObject({ messageId: "ref-1", delivery: { claim: "refused", reason: "no-channel-stream" } });
+  });
+
+  test("no channel-on connection at all: one log line and one activity event per minute (not per retry), and the snapshot names the account", async () => {
+    await connect({ "x-agent-name": "tools-only" }); // no x-rocketr-channel: on at all
+    const key = r.sessions()[0]!.key;
+    r.pending.push({ key, frame: { content: "anyone?", meta: { message_id: "nc-1" } } });
+    await r.deliver();
+    await r.deliver(); // a second attempt within the same minute must not log/record again
+    const noChannel = r.activity.snapshot().events.filter((e) => e.type === "no-channel");
+    expect(noChannel).toHaveLength(1);
+    expect(noChannel[0]).toMatchObject({ username: "claude", waiting: 1 });
+    const logs = r.activity.snapshot().events.filter((e) => e.type === "log").map((e) => (e as { message: string }).message);
+    expect(logs.some((m) => m.includes("no channel-on connection"))).toBe(true);
+    const s = await (await fetch(base + "/api/snapshot")).json() as any;
+    expect(s.sessions.find((x: any) => x.username === "claude").noChannelConnection).toBe(true);
+  });
+
+  test("a C2 from the newest connection stops the loop: no duplicate push to an older, also-live connection", async () => {
+    const older = await connect({ ...ON, "x-agent-name": "older" });
+    await Bun.sleep(80);
+    const newer = await connect({ ...ON, "x-agent-name": "newer" });
+    await Bun.sleep(80); // both connections now have an attached stream
+    const key = r.sessions()[0]!.key;
+    r.pending.push({ key, frame: { content: "only once", meta: { message_id: "once-1" } } });
+    await r.deliver();
+    expect((await newer.nextFrame(2000)).content).toBe("only once"); // the newest claims it first
+    await expect(older.nextFrame(200)).rejects.toThrow(); // the older never sees it too
+    const pushes = r.activity.snapshot().events.filter((e) => e.type === "push");
+    expect(pushes).toHaveLength(1);
+  }, 10_000);
+});
+
 describe("web app", () => {
   test("serves the page", async () => {
     const res = await fetch(base + "/");
