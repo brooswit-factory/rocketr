@@ -299,25 +299,26 @@ network or DNS traffic.
   for telling Claude how to reply. rocketr puts that guidance in `send_message`'s
   description instead.
 - Polling, not Rocket.Chat's realtime API: a push lands within one poll interval (3s floor).
-- **Restarting any rocketr instance deafens idle sessions.** Observed 2026-10-04 on codey (FACTORY-644):
-  after a restart, the MCP connections all reappeared in `/api/snapshot` within seconds, but a test
-  @-mention reached only the sessions that were mid-turn; the idle ones (7 agents) stayed deaf until
-  poked. A live connection is therefore NOT proof of push delivery. Claude Code/thatch do not
-  re-subscribe an idle session's channel stream after the server restarts. `x-rocketr-lookback-sec`
-  replays recent history once a session's stream does come back, but it does not bring it back.
+- **Restarting a rocketr instance may leave an idle session without its push stream.** thatch answers a
+  request that carries an unknown session id with `404 unknown session`, and every id is unknown after a
+  restart. Sessions that are active reconnect on their next call. On 2026-09-18 six idle sessions did not
+  regain their stream for about 28 minutes (FACTORY-524). A later report (2026-10-04) of seven idle agents
+  deaf after a restart turned out to be a test posted in a room those agents were not in, and on a
+  correct-room test the three advisors DID receive pushes after the restart, so treat the mechanism as
+  real but not as the rule: it is not shown to happen to every idle session.
 
-  What this design can and cannot do about it:
+  How to check, and what the design can do:
+  - **A live connection is not proof of delivery.** Check the delivery record. In a room the agent is a
+    member of (verify membership first), post a test @-mention, then read `/api/snapshot`: per message
+    id there is an inbound event per recipient account and a push record (`C2` = the transport accepted
+    the frame; `refused` with a reason otherwise). No event for an account means the message never
+    reached it (membership or notification level), not that it is deaf.
   - **Fewer restarts (yes).** There is no registry or config file to reload, so adding a client,
     changing a client's options or rotating a token never needs a restart: a restart is only ever a
     code deploy. Plan restarts as rare, announced events.
-  - **A keepalive the client sees (no, not by itself).** The proxy cannot force a client to reopen
-    its stream; the client has to notice the drop and act, and an idle one does not. Nothing the
-    server sends helps a client that is not listening.
-  - **After ANY restart, check delivery, don't trust the connection list.** Post a test @-mention to
-    each affected agent and read each agent's own transcript for it; poke any that missed it (inject a
-    turn so it re-subscribes) and re-check. The cutover plan (FACTORY-655) does this after every batch.
-  - A fix belongs on the client side (re-subscribe on stream loss), which is thatch/Claude Code work,
-    not rocketr's.
+  - **A server keepalive (no, not by itself).** The server cannot make a client reopen its stream.
+  - **Fix at the source:** thatch re-creating a session under an old id, or the client re-subscribing on
+    stream loss (FACTORY-524, FACTORY-517).
 
 ### Downloading attachments
 
