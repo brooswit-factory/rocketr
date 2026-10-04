@@ -1,6 +1,6 @@
 {
   "name": "@brooswit/rocketr",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "description": "Rocket.Chat bridge for Claude Code: a thatch MCP server with chat tools and a channel that pushes messages into a live session, per each room's notification preference",
   "license": "MIT",
   "type": "module",

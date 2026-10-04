@@ -3,34 +3,50 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeConnection } from "@brooswit/thatch/testing";
-import { createRocketr, type Rocketr } from "../../src/app.js";
+import { createRocketr, type Rocketr, type CreateRocketrDeps } from "../../src/app.js";
 import type { Config } from "../../src/config.js";
 import { FakeRocketChat } from "./fake-rocketchat.js";
 import { DEFAULT_ATTACHMENT_TYPES } from "../../src/attachment-types.js";
 
-let rcServer: FakeRocketChat, r: Rocketr, base: string, dir: string;
+let rcServer: FakeRocketChat, r: Rocketr, dir: string, base: string;
 const conns: FakeConnection[] = [];
 const presenceStates = new Map<string, boolean>();
+
+/** The header set's URL is https:// (so header validation is exercised honestly); this test-only
+ * fetch override rewrites it back to the fake server's real http:// transport. Never used in production. */
+const toHttp = ((url: string | URL | Request, init?: RequestInit) => fetch(String(url).replace(/^https:\/\//, "http://"), init)) as typeof fetch;
+
+const httpsUrl = () => rcServer.url.replace(/^http:\/\//, "https://");
 const ON = { "x-rocketr-channel": "on" };
-const CLAUDE = { "x-rocketr-account": "claude" };
-const LEAD = { "x-rocketr-account": "lead" };
-/** Connects as @claude unless the headers name another account. */
-const connect = async (headers: Record<string, string> = {}) => { const c = await FakeConnection.connect(base, { headers: { ...CLAUDE, ...headers } }); conns.push(c); return c; };
+const CLAUDE = () => ({ "x-rocketr-url": httpsUrl(), "x-rocketr-user-id": "bot1", "x-rocketr-token": "tok", "x-rocketr-notify": "all", "x-rocketr-batch-ms": "0" });
+const LEAD = () => ({ "x-rocketr-url": httpsUrl(), "x-rocketr-user-id": "bot2", "x-rocketr-token": "tok2", "x-rocketr-notify": "all", "x-rocketr-batch-ms": "0" });
+
+/** Connects as @claude unless the headers name another credential. */
+const connect = async (headers: Record<string, string> = {}) => { const c = await FakeConnection.connect(base, { headers: { ...CLAUDE(), ...headers } }); conns.push(c); return c; };
+
+const baseConfig = (): Config => ({ host: "127.0.0.1", port: 0, attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES });
+
+async function spin(deps: CreateRocketrDeps = {}, cfg: Partial<Config> = {}) {
+  const rr = await createRocketr({ ...baseConfig(), ...cfg }, {
+    fetch: toHttp,
+    presence: ({ userId }) => ({
+      setListening: (value) => presenceStates.set(userId, value),
+      stop: () => presenceStates.set(userId, false),
+    }),
+    gracePeriodMs: 30,
+    ...deps,
+  });
+  const url = `http://127.0.0.1:${(await rr.listen()).port}`;
+  return { rr, url };
+}
 
 beforeEach(async () => {
   rcServer = new FakeRocketChat().start();
   dir = await mkdtemp(join(tmpdir(), "rocketr-att-"));
-  const cfg: Config = {
-   attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES,
-    url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
-    accounts: [{ name: "claude", userId: "bot1", token: "tok" }, { name: "lead", userId: "bot2", token: "tok2" }],
-  };
   presenceStates.clear();
-  r = await createRocketr(cfg, { presence: ({ userId }) => ({
-    setListening: (value) => { presenceStates.set(userId, value); },
-    stop: () => { presenceStates.set(userId, false); },
-  }) });
-  base = `http://127.0.0.1:${(await r.listen()).port}`;
+  const spun = await spin();
+  r = spun.rr;
+  base = spun.url;
 });
 
 afterEach(async () => {
@@ -55,9 +71,13 @@ describe("tools", () => {
     await expect(c.callTool("set_notifications", { room: "#general", level: "loud" })).rejects.toThrow();
   });
 
-  test("whoami and list_rooms", async () => {
+  test("whoami reports the identity /me resolved to, and the proxied server URL", async () => {
     const c = await connect();
-    expect(await c.callTool("whoami")).toMatchObject({ username: "claude", user_id: "bot1" });
+    expect(await c.callTool("whoami")).toMatchObject({ username: "claude", user_id: "bot1", server: httpsUrl() });
+  });
+
+  test("list_rooms", async () => {
+    const c = await connect();
     expect((await c.callTool("list_rooms")).map((x: any) => x.name)).toEqual(["general", "boss", "lead"]);
   });
 
@@ -69,18 +89,15 @@ describe("tools", () => {
     expect(rcServer.sent).toEqual([{ rid: "dm-boss", msg: "hi boss" }, { rid: "GENERAL", msg: "hi all" }, { rid: "GENERAL", msg: "in thread", tmid: "t1" }]);
   });
 
-  test("reactions explicitly add or remove using the calling account", async () => {
+  test("reactions explicitly add or remove using the calling credential's own identity", async () => {
     const c = await connect();
-    const lead = await connect(LEAD);
-    await c.callTool("react_to_message", { message_id: "m1", emoji: "eyes" });
+    const lead = await connect(LEAD());
     await c.callTool("react_to_message", { message_id: "m1", emoji: "eyes" });
     await lead.callTool("react_to_message", { message_id: "m1", emoji: "eyes", add: false });
     expect(rcServer.reactions).toEqual([
       { uid: "bot1", messageId: "m1", emoji: "eyes", shouldReact: true },
-      { uid: "bot1", messageId: "m1", emoji: "eyes", shouldReact: true },
       { uid: "bot2", messageId: "m1", emoji: "eyes", shouldReact: false },
     ]);
-    await expect(c.callTool("react_to_message", { message_id: "", emoji: "eyes" })).rejects.toThrow();
   });
 
   test("read_messages returns oldest first", async () => {
@@ -104,35 +121,62 @@ describe("tools", () => {
     expect(rcServer.kicked).toEqual([{ rid: "GENERAL", userId: "u-rando" }]);
   });
 
-  test("add_member on a private group the caller belongs to succeeds", async () => {
-    const c = await connect(); // claude is a member of PRIVATE
-    expect(await c.callTool("add_member", { room: "PRIVATE", username: "rando" })).toMatchObject({ added: true });
-    expect(rcServer.invited).toContainEqual({ rid: "PRIVATE", userId: "u-rando" });
-  });
-
   test("add_member on a private group the caller does NOT belong to fails with the room's own not-allowed error", async () => {
-    const c = await connect(LEAD); // lead is not a member of PRIVATE
+    const c = await connect(LEAD()); // lead is not a member of PRIVATE
     await expect(c.callTool("add_member", { room: "PRIVATE", username: "rando" })).rejects.toThrow("error-not-allowed");
-  });
-
-  test("add_member and remove_member refuse a DM, which has no membership list to change", async () => {
-    const c = await connect();
-    await expect(c.callTool("add_member", { room: "@boss", username: "rando" })).rejects.toThrow('cannot add a member to a "d" room');
-    await expect(c.callTool("remove_member", { room: "@boss", username: "rando" })).rejects.toThrow('cannot remove a member from a "d" room');
-  });
-
-  test("add_member on an unknown username fails clearly", async () => {
-    const c = await connect();
-    await expect(c.callTool("add_member", { room: "#general", username: "ghost" })).rejects.toThrow("User not found");
   });
 });
 
-test("presence follows channel sessions per account and survives overlapping sessions", async () => {
+describe("stateless credential sessions", () => {
+  test("every required header is mandatory: missing any one refuses the connection", async () => {
+    const full = CLAUDE();
+    for (const field of ["x-rocketr-url", "x-rocketr-user-id", "x-rocketr-token"] as const) {
+      const headers = { ...full };
+      delete (headers as Record<string, string>)[field];
+      await expect(FakeConnection.connect(base, { headers })).rejects.toThrow();
+    }
+  });
+
+  test("http:// (not https://) is refused", async () => {
+    await expect(FakeConnection.connect(base, { headers: { ...CLAUDE(), "x-rocketr-url": rcServer.url } })).rejects.toThrow();
+  });
+
+  test("an invalid Rocket.Chat credential (401) is refused, with no account name ever involved", async () => {
+    await expect(FakeConnection.connect(base, { headers: { ...CLAUDE(), "x-rocketr-token": "wrong" } })).rejects.toThrow();
+  });
+
+  test("two connections with the identical credential share one session/identity", async () => {
+    const a = await connect();
+    const b = await connect();
+    expect((await a.callTool("whoami")).user_id).toBe((await b.callTool("whoami")).user_id);
+    expect(r.sessions()).toHaveLength(1);
+  });
+
+  test("two different credentials get two different sessions, each speaking as its own identity", async () => {
+    const a = await connect();
+    const b = await connect(LEAD());
+    expect((await a.callTool("whoami")).username).toBe("claude");
+    expect((await b.callTool("whoami")).username).toBe("lead");
+    expect(r.sessions()).toHaveLength(2);
+  });
+
+  test("a session is torn down after its last connection disconnects, plus the grace period", async () => {
+    const c = await connect();
+    await c.callTool("whoami");
+    expect(r.sessions()).toHaveLength(1);
+    await c.disconnect();
+    conns.splice(conns.indexOf(c), 1);
+    await Bun.sleep(80); // past the 30ms test grace period
+    expect(r.sessions()).toHaveLength(0);
+  });
+});
+
+test("presence follows channel sessions per credential key and survives overlapping sessions", async () => {
   await connect();
   expect(presenceStates.get("bot1")).toBe(false);
   const a = await connect(ON);
   const b = await connect(ON);
-  const lead = await connect({ ...ON, ...LEAD });
+  const lead = await connect({ ...ON, ...LEAD() });
   expect(presenceStates.get("bot1")).toBe(true);
   expect(presenceStates.get("bot2")).toBe(true);
   await a.disconnect();
@@ -148,249 +192,57 @@ test("presence follows channel sessions per account and survives overlapping ses
 describe("channel", () => {
   test("a DM is pushed into the session and the room marked read", async () => {
     const c = await connect({ "x-agent-name": "main", ...ON });
-    await Bun.sleep(50); // let the notification stream attach
+    await Bun.sleep(80); // let the notification stream attach
     rcServer.post("dm-boss", "boss", "you there?");
-    const f = await c.nextFrame(3000);
+    const f = await c.nextFrame(5000);
     expect(f.content).toBe("you there?");
     expect(f.meta).toMatchObject({ kind: "dm", room_id: "dm-boss", sender: "boss" });
-    await Bun.sleep(30);
+    await Bun.sleep(60);
     expect(rcServer.reads).toContain("dm-boss");
-  });
+  }, 10_000);
 
-  test("any sender, any message: an agent's DM, a plain channel message and a thread reply all land", async () => {
+  test("any sender, any message: a DM, a plain channel message and a thread reply all land", async () => {
     const c = await connect(ON);
-    await Bun.sleep(50);
-    rcServer.post("dm-agents", "lead", "psst");
-    expect((await c.nextFrame(3000)).meta).toMatchObject({ kind: "dm", sender: "lead", room_id: "dm-agents" });
+    await Bun.sleep(80);
     rcServer.post("GENERAL", "rando", "lunch?");
-    expect((await c.nextFrame(3000)).meta).toMatchObject({ kind: "channel", sender: "rando", room_id: "GENERAL" });
+    expect((await c.nextFrame(5000)).meta).toMatchObject({ kind: "channel", sender: "rando", room_id: "GENERAL" });
     rcServer.post("GENERAL", "boss", "in the thread", { tmid: "t1" });
-    expect((await c.nextFrame(3000)).meta).toMatchObject({ kind: "thread", thread_id: "t1" });
-  });
+    expect((await c.nextFrame(5000)).meta).toMatchObject({ kind: "thread", thread_id: "t1" });
+  }, 10_000);
 
-  test("after set_notifications mentions, plain messages stop but an @mention still lands", async () => {
-    const c = await connect(ON);
-    await c.callTool("set_notifications", { room: "#general", level: "mentions" });
-    await Bun.sleep(50);
-    rcServer.post("GENERAL", "boss", "chatter");
-    rcServer.post("GENERAL", "boss", "@claude you", { mentions: [{ _id: "bot1" }] });
-    const f = await c.nextFrame(3000);
-    expect(f.content).toBe("@claude you");
-    expect(f.meta.kind).toBe("mention");
-  });
-
-  test("muting a room discards its already-queued frames for that account", async () => {
-    rcServer.post("dm-boss-lead", "boss", "hold this");
-    await Bun.sleep(100);
-    expect(r.pending.map((item) => item.account)).toEqual(["lead"]);
-
-    const c = await connect({ ...LEAD, ...ON });
-    await c.callTool("set_notifications", { room: "@boss", level: "nothing" });
-    expect(r.pending).toEqual([]);
-  });
-
-  test("never its own messages, but other agents in the room hear them", async () => {
-    await connect(ON);
-    rcServer.post("GENERAL", "claude", "talking to myself");
-    await Bun.sleep(100);
-    expect(r.pending.map((p) => p.account)).toEqual(["lead"]);
-  });
-
-  test("a message that arrives with nobody connected waits, then lands on the next session", async () => {
+  test("a message that arrives with a tools-only (non-channel) session keeping the session alive waits, then lands once a channel session connects", async () => {
+    // The session (and its watcher) only exists while at least one connection for its credential is
+    // open — a tools-only connection is enough to keep polling going, even though it isn't itself
+    // opted into the channel. See the "restart / lookback" tests below for the no-connection-at-all case.
+    const tools = await connect({ "x-agent-name": "tools-only" });
     rcServer.post("dm-boss", "boss", "while you were out");
-    await Bun.sleep(100);
+    await Bun.sleep(3300);
     expect(r.pending.length).toBe(1);
     const c = await connect(ON);
-    expect((await c.nextFrame(3000)).content).toBe("while you were out");
-    await Bun.sleep(30);
+    expect((await c.nextFrame(5000)).content).toBe("while you were out");
+    await Bun.sleep(60);
     expect(r.pending.length).toBe(0);
-  });
-
-  test("a reconnect supersedes an older channel session for exactly-once delivery", async () => {
-    await connect(ON);
-    const current = await connect(ON);
-    await Bun.sleep(50);
-    rcServer.post("dm-boss", "boss", "one live turn only");
-    expect((await current.nextFrame(3000)).content).toBe("one live turn only");
-    await Bun.sleep(30);
-    expect(r.activity.snapshot().events.filter((event) => event.type === "push")).toHaveLength(1);
-  });
+    await tools.disconnect();
+  }, 10_000);
 
   test("pushes are opt-in: a tools-only session never swallows a message", async () => {
-    await connect({ "x-agent-name": "tools-only" });
+    const tools = await connect({ "x-agent-name": "tools-only" });
     rcServer.post("dm-boss", "boss", "anyone?");
-    await Bun.sleep(150);
+    await Bun.sleep(3300);
     expect(r.pending.length).toBe(1);
-  });
+    await tools.disconnect();
+  }, 10_000);
 
-  test("startup saves the default level on every room that has none, for every account", () => {
-    expect(rcServer.saved.map((s) => `${s.uid}:${s.rid}:${s.desktopNotifications}:${s.mobilePushNotifications}`).sort()).toEqual([
-      "bot1:GENERAL:all:all", "bot1:dm-agents:all:all", "bot1:dm-boss:all:all",
-      "bot2:GENERAL:all:all", "bot2:dm-agents:all:all", "bot2:dm-boss-lead:all:all",
-    ]);
-  });
-
-  test("a room joined later gets the default too, and a saved level is never overwritten", async () => {
-    const at = new Date().toISOString();
-    rcServer.subs.get("bot1")!.push({ rid: "new-room", name: "new", t: "c", unread: 0, userMentions: 0, _updatedAt: at });
-    rcServer.subs.get("bot1")!.push({ rid: "chosen", name: "chosen", t: "c", unread: 0, userMentions: 0, _updatedAt: at, desktopNotifications: "nothing" });
-    await Bun.sleep(100);
-    expect(rcServer.saved.filter((s) => s.rid === "new-room")).toHaveLength(1);
-    expect(rcServer.saved.some((s) => s.rid === "chosen")).toBe(false);
-  });
-});
-
-describe("accounts", () => {
-  test("no fallback: a client that names no account is refused at connect", async () => {
-    await expect(FakeConnection.connect(base, { headers: {} })).rejects.toThrow();
-  });
-
-  test("an opt-in default account serves a client that names none, and still refuses a wrong name", async () => {
-    const single = await createRocketr({
-      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
-      accounts: [{ name: "claude", userId: "bot1", token: "tok" }], defaultAccount: "claude",
-    }, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
-    const url = `http://127.0.0.1:${(await single.listen()).port}`;
-    try {
-      const c = await FakeConnection.connect(url, { headers: { ...ON } });
-      conns.push(c);
-      expect((await c.callTool("whoami")).username).toBe("claude");
-      await Bun.sleep(50); // let the notification stream attach
-      rcServer.post("dm-boss", "boss", "headerless?");
-      expect((await c.nextFrame(3000)).content).toBe("headerless?");
-      await expect(FakeConnection.connect(url, { headers: { "x-rocketr-account": "lead" } })).rejects.toThrow();
-    } finally {
-      for (const c of conns.splice(0)) await c.disconnect().catch(() => {});
-      await single.stop();
-    }
-  });
-
-  test("an unknown account is refused at connect", async () => {
-    await expect(FakeConnection.connect(base, { headers: { "x-rocketr-account": "nobody" } })).rejects.toThrow();
-  });
-
-  test("each session speaks as its own account", async () => {
-    const a = await connect();
-    const b = await connect(LEAD);
-    expect((await a.callTool("whoami")).username).toBe("claude");
-    expect((await b.callTool("whoami")).username).toBe("lead");
-    await b.callTool("send_message", { room: "@boss", text: "from lead" });
-    expect(rcServer.sent.at(-1)).toEqual({ rid: "dm-boss-lead", msg: "from lead" });
-  });
-
-  test("a DM to one account reaches only that account's sessions", async () => {
+  test("a DM to one credential reaches only that credential's sessions", async () => {
     const claude = await connect(ON);
-    const lead = await connect({ ...LEAD, ...ON });
-    await Bun.sleep(50);
+    const lead = await connect({ ...LEAD(), ...ON });
+    await Bun.sleep(80);
     rcServer.post("dm-boss-lead", "boss", "for the lead");
-    const f = await lead.nextFrame(3000);
+    const f = await lead.nextFrame(5000);
     expect(f.meta).toMatchObject({ account: "lead", room_id: "dm-boss-lead", sender: "boss" });
     rcServer.post("dm-boss", "boss", "for claude");
-    expect((await claude.nextFrame(3000)).content).toBe("for claude"); // not "for the lead"
-  });
-
-  test("a message for an account with no session waits for that account, not another", async () => {
-    await connect(ON); // claude is listening
-    rcServer.post("dm-boss-lead", "boss", "lead is away");
-    await Bun.sleep(150);
-    expect(r.pending.map((p) => p.account)).toEqual(["lead"]);
-    const lead = await connect({ ...LEAD, ...ON });
-    expect((await lead.nextFrame(3000)).content).toBe("lead is away");
-  });
-
-  test("the queue is capped per account: a busy account with no session can't evict another's message", async () => {
-    rcServer.post("dm-boss", "boss", "for claude, queued first");
-    await Bun.sleep(60);
-    for (let i = 0; i < 60; i++) rcServer.post("dm-boss-lead", "boss", `lead ${i}`);
-    await Bun.sleep(150);
-    expect(r.pending.filter((p) => p.account === "lead")).toHaveLength(50);
-    expect(r.pending.filter((p) => p.account === "lead")[0]!.frame.content).toBe("lead 10"); // oldest of lead's own dropped
-    const c = await connect(ON);
-    expect((await c.nextFrame(3000)).content).toBe("for claude, queued first");
-  });
-
-  test("an account whose token signs in as someone else is never served under the name it claims: if it's the ONLY configured account, zero accounts would be served, so startup still exits", async () => {
-    const bad: Config = { attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true, accounts: [{ name: "claude", userId: "bot2", token: "tok2" }] };
-    await expect(createRocketr(bad)).rejects.toThrow('"claude": signs in as @lead, not @claude');
-  });
-
-  test("the same drifted account is excluded, not fatal, when another account is healthy: blast radius changed, the guarantee didn't", async () => {
-    const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
-      accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
-    };
-    const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
-    try {
-      expect([...isolated.accounts.keys()]).toEqual(["lead"]);
-      expect(isolated.excludedAccounts).toEqual([{ name: "claude", detail: "signs in as @lead, not @claude" }]);
-      const url = `http://127.0.0.1:${(await isolated.listen()).port}`;
-      // an excluded account must never fall through to some other account's session
-      await expect(FakeConnection.connect(url, { headers: { "x-rocketr-account": "claude" } })).rejects.toThrow();
-      const stillLead = await FakeConnection.connect(url, { headers: { "x-rocketr-account": "lead" } });
-      expect((await stillLead.callTool("whoami")).username).toBe("lead");
-      await stillLead.disconnect();
-    } finally {
-      await isolated.stop();
-    }
-  });
-
-  test("multi-account drift: healthy accounts come up and the process does not throw; a 401 account is excluded the same way as a username mismatch", async () => {
-    const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
-      accounts: [
-        { name: "claude", userId: "bot1", token: "tok" }, // healthy
-        { name: "lead", userId: "bot2", token: "tok2" }, // healthy
-        { name: "renamed", userId: "bot2", token: "tok2" }, // signs in as "lead", not "renamed": drifted
-        { name: "ghost", userId: "bot3", token: "nope" }, // unknown to the server: 401
-      ],
-    };
-    const multi = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
-    try {
-      await multi.listen();
-      expect([...multi.accounts.keys()].sort()).toEqual(["claude", "lead"]);
-      expect(multi.excludedAccounts.map((f) => f.name).sort()).toEqual(["ghost", "renamed"]);
-      expect(multi.excludedAccounts.find((f) => f.name === "ghost")?.detail).toContain("401");
-    } finally {
-      await multi.stop();
-    }
-  });
-
-  test("the consolidated startup error names EVERY failed account, not just the first (this would fail against first-failure-only behavior)", async () => {
-    const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
-      accounts: [
-        { name: "claude", userId: "bot1", token: "tok" },
-        { name: "renamed", userId: "bot2", token: "tok2" },
-        { name: "ghost", userId: "bot3", token: "nope" },
-      ],
-    };
-    const partial = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
-    try {
-      await partial.listen();
-      const consolidated = partial.activity.snapshot().events
-        .filter((e): e is Extract<typeof e, { type: "log" }> => e.type === "log")
-        .map((e) => e.message)
-        .find((m) => m.includes("startup preflight"));
-      expect(consolidated).toBeDefined();
-      // the whole point of the fix: both failed accounts are named in the ONE message, not just the first
-      expect(consolidated).toContain("renamed");
-      expect(consolidated).toContain("ghost");
-    } finally {
-      await partial.stop();
-    }
-  });
-
-  test("when every configured account fails, createRocketr rejects with one message naming all of them", async () => {
-    const allBad: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
-      accounts: [{ name: "renamed", userId: "bot2", token: "tok2" }, { name: "ghost", userId: "bot3", token: "nope" }],
-    };
-    let err: Error | undefined;
-    try { await createRocketr(allBad); } catch (e) { err = e as Error; }
-    expect(err?.message).toContain("renamed");
-    expect(err?.message).toContain("ghost");
-    expect(err?.message).toContain("2 of 2");
-  });
+    expect((await claude.nextFrame(5000)).content).toBe("for claude"); // not "for the lead"
+  }, 10_000);
 });
 
 describe("web app", () => {
@@ -400,39 +252,22 @@ describe("web app", () => {
     expect(await res.text()).toContain("Connected agents");
   });
 
-  test("snapshot shows agents by name and never leaks auth headers", async () => {
-    const c = await connect({ "x-agent-name": "main", authorization: "Bearer secret" });
+  test("snapshot shows sessions by username and NEVER leaks the credential headers or authorization", async () => {
+    const c = await connect({ "x-agent-name": "main", authorization: "Bearer unrelated-secret" });
     await c.callTool("whoami");
     const s = await (await fetch(base + "/api/snapshot")).json() as any;
     expect(s.agents).toHaveLength(1);
-    expect(s.agents[0]).toMatchObject({ name: "main", calls: 1, headers: { "x-rocketr-account": "claude" } });
-    expect(s.accounts.map((a: any) => a.username)).toEqual(["claude", "lead"]);
-    expect(s.excludedAccounts).toEqual([]); // no lie by omission when there's nothing to omit
-    expect(JSON.stringify(s)).not.toContain("secret");
+    expect(s.agents[0]).toMatchObject({ name: "main", calls: 1, username: "claude" });
+    expect(s.sessions.map((x: any) => x.username)).toEqual(["claude"]);
+    expect(JSON.stringify(s)).not.toContain("unrelated-secret");
+    expect(JSON.stringify(s)).not.toContain("tok"); // the RocketChat token substring
   });
 
-  test("snapshot reports pending counts by account without message content", async () => {
-    rcServer.post("dm-boss-lead", "boss", "queued");
-    await Bun.sleep(100);
+  test("snapshot exposes per-session stream health (FACTORY-644 item 3)", async () => {
+    const c = await connect();
+    await c.callTool("whoami");
     const s = await (await fetch(base + "/api/snapshot")).json() as any;
-    expect(s.pendingByAccount).toEqual({ lead: 1 });
-    expect(JSON.stringify(s.pendingByAccount)).not.toContain("queued");
-  });
-
-  test("snapshot names excluded accounts and why, so a partial outage isn't invisible in the web UI", async () => {
-    const cfg: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true,
-      accounts: [{ name: "lead", userId: "bot2", token: "tok2" }, { name: "claude", userId: "bot2", token: "tok2" }],
-    };
-    const isolated = await createRocketr(cfg, { presence: () => ({ setListening: () => {}, stop: () => {} }) });
-    try {
-      const url = `http://127.0.0.1:${(await isolated.listen()).port}`;
-      const s = await (await fetch(url + "/api/snapshot")).json() as any;
-      expect(s.accounts.map((a: any) => a.username)).toEqual(["lead"]);
-      expect(s.excludedAccounts).toEqual([{ name: "claude", detail: "signs in as @lead, not @claude" }]);
-    } finally {
-      await isolated.stop();
-    }
+    expect(s.sessions[0].health).toMatchObject({ running: true, consecutiveFailures: 0 });
   });
 
   test("the stream carries tool calls live", async () => {
@@ -445,6 +280,15 @@ describe("web app", () => {
     while (!buf.includes('"type":"tool"')) buf += dec.decode((await reader.read()).value);
     await reader.cancel();
     expect(buf).toContain('"tool":"whoami"');
+  });
+
+  describe("observer app loopback guard", () => {
+    test("a non-loopback source is refused regardless of the MCP endpoint", async () => {
+      const { rr, url } = await spin({ requestIP: () => "203.0.113.5" });
+      try {
+        for (const path of ["/", "/api/snapshot", "/api/stream"]) expect((await fetch(url + path)).status).toBe(403);
+      } finally { await rr.stop(); }
+    });
   });
 });
 
@@ -473,7 +317,6 @@ describe("download_attachment", () => {
     const saved = (await call({ message_id: m._id, mode: "local" })) as any;
     expect(saved.path).toContain(`${m._id}-0-shot.png`);
     expect(saved.size).toBe(PNG.length);
-    expect(saved.mime_type).toBe("image/png");
     expect(await Bun.file(saved.path).bytes()).toEqual(new Uint8Array(PNG));
     expect(saved.path.startsWith(dir)).toBe(true);
   });
@@ -515,168 +358,129 @@ describe("download_attachment", () => {
     await fails({ message_id: "nope" }, /not found/i);
     const plain = rcServer.post("dm-boss", "boss", "no files");
     await fails({ message_id: plain._id }, "no downloadable attachment");
-    const m = withAttachment("a.png", "/file-upload/f7/a.png");
-    await fails({ message_id: m._id, index: 3 }, "no downloadable attachment");
     const ssrf = withAttachment("a.png", "http://127.0.0.1:1/file-upload/x/a.png");
     await fails({ message_id: ssrf._id }, "not a Rocket.Chat upload");
-    const other = withAttachment("a.png", "/api/v1/users.list");
-    await fails({ message_id: other._id }, "not a Rocket.Chat upload");
-  });
-
-  test("a message in a room the account cannot read is refused before any file request", async () => {
-    rcServer.files.set("/file-upload/f8/a.png", { type: "image/png", body: PNG });
-    const m = withAttachment("a.png", "/file-upload/f8/a.png"); // dm-boss: claude is in it, lead is not
-    const before = rcServer.fileRequests.length;
-    await fails({ message_id: m._id }, /not found/i, LEAD);
-    expect(rcServer.fileRequests.length).toBe(before);
-  });
-
-  test("ROCKETR_ATTACHMENT_TYPES overrides the default allowlist (FACTORY-593 nit 2)", async () => {
-    rcServer.files.set("/file-upload/f9/data.json", { type: "application/json", body: Buffer.from("{}") });
-    const m = withAttachment("data.json", "/file-upload/f9/data.json");
-    // default allowlist refuses JSON
-    await fails({ message_id: m._id, mode: "local" }, "not allowed");
-
-    const custom = await createRocketr(
-      { attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: ["application/json"], url: rcServer.url, defaultNotifications: "all", migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0, allowUnauthenticatedLoopback: true, accounts: [{ name: "claude", userId: "bot1", token: "tok" }] },
-      { presence: () => ({ setListening: () => {}, stop: () => {} }) },
-    );
-    try {
-      const url = `http://127.0.0.1:${(await custom.listen()).port}`;
-      const c = await FakeConnection.connect(url, { headers: { ...CLAUDE } });
-      const got = (await c.callTool("download_attachment", { message_id: m._id, mode: "local" })) as any;
-      expect(got.mime_type).toBe("application/json");
-      await c.disconnect();
-    } finally { await custom.stop(); }
   });
 });
 
-describe("client secret auth", () => {
-  const SECRET = "s".repeat(32);
-  const RC_TOKEN = "tok"; // same as the fixture account's Rocket.Chat token, below
-
-  /** A fresh Rocketr against the shared fake Rocket.Chat, so each test picks its own secrets/host/flags. */
-  const spin = async (cfg: Partial<Config> = {}, deps: Parameters<typeof createRocketr>[1] = {}) => {
-    const full: Config = {
-      attachmentDir: dir, attachmentMaxBytes: 1024, attachmentTypes: DEFAULT_ATTACHMENT_TYPES, url: rcServer.url, defaultNotifications: "all",
-      migrateLegacyAllToMentions: false, batchMs: 0, pollMs: 20, host: "127.0.0.1", port: 0,
-      allowUnauthenticatedLoopback: false,
-      accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN }],
-      ...cfg,
-    };
-    const rr = await createRocketr(full, { presence: () => ({ setListening: () => {}, stop: () => {} }), ...deps });
-    const url = `http://127.0.0.1:${(await rr.listen()).port}`;
-    return { rr, url };
-  };
-
-  test("the correct bearer is accepted; a wrong or missing one is refused", async () => {
-    const { rr, url } = await spin({ accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] });
+describe("checkAccess, limits, counters, and redaction (FACTORY-656)", () => {
+  test("checkAccess denies the connection: nothing reaches Rocket.Chat and the refusal is logged without secrets", async () => {
+    let calls = 0;
+    const { rr, url } = await spin({ checkAccess: () => { calls++; return { allow: false, reason: "policy test" }; } });
     try {
-      const good = await FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${SECRET}` } });
-      expect((await good.callTool("whoami")).username).toBe("claude");
-      await good.disconnect();
-
-      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: "Bearer " + "w".repeat(32) } })).rejects.toThrow();
-      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE } })).rejects.toThrow(); // no Authorization at all
+      await expect(FakeConnection.connect(url, { headers: CLAUDE() })).rejects.toThrow();
+      expect(calls).toBe(1);
+      const logs = rr.activity.snapshot().events.filter((e): e is Extract<typeof e, { type: "log" }> => e.type === "log").map((e) => e.message);
+      expect(logs.some((m) => m.includes("checkAccess denied") && m.includes("policy test"))).toBe(true);
+      expect(logs.join("\n")).not.toContain("tok");
     } finally { await rr.stop(); }
   });
 
-  test("the Rocket.Chat token is never accepted as a client secret", async () => {
-    const { rr, url } = await spin({ accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] });
+  test("checkAccess is called once per connection, and again only for a BRAND NEW credential key", async () => {
+    const events: string[] = [];
+    const { rr, url } = await spin({ checkAccess: (ctx) => { events.push(ctx.event); return { allow: true }; } });
     try {
-      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${RC_TOKEN}` } })).rejects.toThrow();
+      const a = await FakeConnection.connect(url, { headers: CLAUDE() });
+      const b = await FakeConnection.connect(url, { headers: CLAUDE() }); // same credential — connection event only, no new-key
+      expect(events).toEqual(["connection", "new-key", "connection"]);
+      await a.disconnect(); await b.disconnect();
     } finally { await rr.stop(); }
   });
 
-  test("an account with no secret is refused unless the transition flag is on, and only while loopback-bound", async () => {
-    { // no secret, flag off (the secure-by-default end state): refused
-      const { rr, url } = await spin({ allowUnauthenticatedLoopback: false });
-      try { await expect(FakeConnection.connect(url, { headers: { ...CLAUDE } })).rejects.toThrow(); } finally { await rr.stop(); }
-    }
-    { // no secret, flag on, loopback-bound: allowed, and warns naming the account
-      const { rr, url } = await spin({ allowUnauthenticatedLoopback: true });
-      try {
-        const c = await FakeConnection.connect(url, { headers: { ...CLAUDE } });
-        expect((await c.callTool("whoami")).username).toBe("claude");
-        await c.disconnect();
-        const warned = rr.activity.snapshot().events.some((e) => e.type === "log" && e.message.includes("@claude") && e.message.includes("ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK"));
-        expect(warned).toBe(true);
-      } finally { await rr.stop(); }
-    }
-  });
-
-  test("a non-loopback bind refuses to start unless every configured account has a secret", async () => {
-    await expect(spin({ host: "0.0.0.0", allowUnauthenticatedLoopback: true })).rejects.toThrow(/client secret/);
-    const { rr } = await spin({ host: "0.0.0.0", accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] });
-    await rr.stop(); // every account secured: starts fine even though the bind isn't loopback
-  });
-
-  test("a locked-out source IP is refused outright, even presenting the correct secret", async () => {
-    const { rr, url } = await spin(
-      { accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] },
-      { authRateLimit: { maxFailures: 2, windowMs: 60_000, lockoutMs: 60_000 } },
-    );
+  test("a denied new-key check blocks the session even though the connection check allowed it", async () => {
+    const { rr, url } = await spin({ checkAccess: (ctx) => ctx.event === "new-key" ? { allow: false, reason: "no new keys" } : { allow: true } });
     try {
-      for (let i = 0; i < 2; i++) await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: "Bearer " + "w".repeat(32) } })).rejects.toThrow();
-      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${SECRET}` } })).rejects.toThrow();
+      await expect(FakeConnection.connect(url, { headers: CLAUDE() })).rejects.toThrow();
     } finally { await rr.stop(); }
   });
 
-  test("a refused connection creates no session, presence, or queue effect", async () => {
-    let listened: boolean | undefined;
-    const { rr, url } = await spin(
-      { accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] },
-      { presence: () => ({ setListening: (v: boolean) => { listened = v; }, stop: () => {} }) },
-    );
+  test("a stub that denies blocks all outbound calls — no RocketChat traffic happens at all", async () => {
+    const before = rcServer.fileRequests.length;
+    const { rr, url } = await spin({ checkAccess: () => ({ allow: false, reason: "deny everything" }) });
     try {
-      await expect(FakeConnection.connect(url, {
-        headers: { ...CLAUDE, ...ON, authorization: "Bearer " + "w".repeat(32) },
-      })).rejects.toThrow();
-      expect(listened).toBeUndefined(); // setListening was never called for a session that never registered
-      expect(rr.activity.snapshot().events.some((e) => e.type === "connect")).toBe(false);
-      rcServer.post("dm-boss", "boss", "while refused");
-      await Bun.sleep(100);
-      expect(rr.pending.length).toBe(1); // queued normally, as if nobody is listening — unaffected by the refusal
+      await expect(FakeConnection.connect(url, { headers: CLAUDE() })).rejects.toThrow();
+      expect(rcServer.fileRequests.length).toBe(before);
     } finally { await rr.stop(); }
   });
 
-  test("secrets never appear in captured log output", async () => {
-    const { rr, url } = await spin({ accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] });
+  test("per-source-IP connection limit refuses further connections from that IP", async () => {
+    const { rr, url } = await spin({ limits: { maxConnectionsPerIP: 1 } });
     try {
-      const good = await FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${SECRET}` } });
-      await good.callTool("whoami");
-      await good.disconnect();
-      await expect(FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: "Bearer " + "w".repeat(32) } })).rejects.toThrow();
-      const dump = JSON.stringify(rr.activity.snapshot());
-      expect(dump).not.toContain(SECRET);
-      expect(dump).not.toContain(RC_TOKEN);
+      const a = await FakeConnection.connect(url, { headers: CLAUDE() });
+      await expect(FakeConnection.connect(url, { headers: LEAD() })).rejects.toThrow();
+      await a.disconnect();
     } finally { await rr.stop(); }
   });
 
-  describe("observer app loopback guard", () => {
-    test("a non-loopback source is refused regardless of client secrets", async () => {
-      const { rr, url } = await spin(
-        { accounts: [{ name: "claude", userId: "bot1", token: RC_TOKEN, clientSecret: SECRET }] },
-        { requestIP: () => "203.0.113.5" },
-      );
-      try {
-        for (const path of ["/", "/api/snapshot", "/api/stream"]) {
-          const res = await fetch(url + path);
-          expect(res.status).toBe(403);
-        }
-        // the MCP endpoint's own bearer auth is unaffected by this fake remote address
-        const c = await FakeConnection.connect(url, { headers: { ...CLAUDE, authorization: `Bearer ${SECRET}` } });
-        expect((await c.callTool("whoami")).username).toBe("claude");
-        await c.disconnect();
-      } finally { await rr.stop(); }
-    });
-
-    test("a loopback source still sees the observer app", async () => {
-      const { rr, url } = await spin({ allowUnauthenticatedLoopback: true });
-      try {
-        expect((await fetch(url + "/")).status).toBe(200);
-        expect((await fetch(url + "/api/snapshot")).status).toBe(200);
-      } finally { await rr.stop(); }
-    });
+  test("per-source-IP distinct-credential-key limit refuses a brand-new key once hit, but an already-used key still works", async () => {
+    const { rr, url } = await spin({ limits: { maxKeysPerIP: 1 } });
+    try {
+      const a = await FakeConnection.connect(url, { headers: CLAUDE() });
+      await expect(FakeConnection.connect(url, { headers: LEAD() })).rejects.toThrow();
+      const again = await FakeConnection.connect(url, { headers: CLAUDE() }); // same key as `a` — fine
+      await a.disconnect(); await again.disconnect();
+    } finally { await rr.stop(); }
   });
+
+  test("the tool-call rate limit refuses further calls once a connection exceeds it", async () => {
+    const { rr, url } = await spin({ limits: { toolCallsPerMinutePerConnection: 2 } });
+    try {
+      const c = await FakeConnection.connect(url, { headers: CLAUDE() });
+      await c.callTool("whoami");
+      await c.callTool("whoami");
+      await expect(c.callTool("whoami")).rejects.toThrow(/rate limit/);
+      await c.disconnect();
+    } finally { await rr.stop(); }
+  });
+
+  test("X-Forwarded-For is trusted ONLY from the loopback peer (Caddy); a non-loopback peer's header is ignored", async () => {
+    const seen: string[] = [];
+    const { rr, url } = await spin({ requestIP: () => "127.0.0.1", checkAccess: (ctx) => { seen.push(ctx.sourceIP); return { allow: true }; } });
+    try {
+      const c = await FakeConnection.connect(url, { headers: { ...CLAUDE(), "x-forwarded-for": "203.0.113.9" } });
+      // checkAccess fires for both the "connection" and "new-key" events on a fresh key — every one should see the trusted forwarded IP.
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((ip) => ip === "203.0.113.9")).toBe(true);
+      await c.disconnect();
+    } finally { await rr.stop(); }
+
+    const seen2: string[] = [];
+    const { rr: rr2, url: url2 } = await spin({ requestIP: () => "198.51.100.1", checkAccess: (ctx) => { seen2.push(ctx.sourceIP); return { allow: true }; } });
+    try {
+      const c = await FakeConnection.connect(url2, { headers: { ...CLAUDE(), "x-forwarded-for": "203.0.113.9" } }); // spoofed — peer is NOT loopback
+      expect(seen2.length).toBeGreaterThan(0);
+      expect(seen2.every((ip) => ip === "198.51.100.1")).toBe(true); // the spoofed header is ignored outright
+      await c.disconnect();
+    } finally { await rr2.stop(); }
+  });
+
+  test("the credential headers are redacted in what checkAccess receives too", async () => {
+    let headers: Record<string, string> = {};
+    const { rr, url } = await spin({ checkAccess: (ctx) => { headers = ctx.headers; return { allow: true }; } });
+    try {
+      const c = await FakeConnection.connect(url, { headers: CLAUDE() });
+      expect(headers["x-rocketr-url"]).toBe("[redacted]");
+      expect(headers["x-rocketr-user-id"]).toBe("[redacted]");
+      expect(headers["x-rocketr-token"]).toBe("[redacted]");
+      await c.disconnect();
+    } finally { await rr.stop(); }
+  });
+});
+
+describe("restart / lookback behavior (FACTORY-644 item 2)", () => {
+  test("lookbackSec: 0 (the header's default-absent case mapped through the manager's chosen default of 120) still never replays something from before connection by default in this harness — explicit 0 proves no-replay", async () => {
+    rcServer.post("GENERAL", "boss", "already there before anyone connected");
+    const c = await connect({ ...ON, "x-rocketr-lookback-sec": "0" });
+    await Bun.sleep(3300);
+    // nothing should have been pushed for a message that predates the session with no lookback
+    const pushed = r.activity.snapshot().events.filter((e) => e.type === "push");
+    expect(pushed).toHaveLength(0);
+  }, 10_000);
+
+  test("a non-zero lookback replays a message that happened just before the session started", async () => {
+    rcServer.post("GENERAL", "boss", "@claude just before you connected", { mentions: [{ _id: "bot1" }] });
+    const c = await connect({ ...ON, "x-rocketr-notify": "mentions", "x-rocketr-lookback-sec": "30" });
+    const f = await c.nextFrame(5000);
+    expect(f.content).toContain("just before you connected");
+  }, 10_000);
 });

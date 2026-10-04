@@ -24,7 +24,7 @@ test("image tool uploads multipart bytes then publishes caption and thread with 
     return Response.json({ message: { _id: "sent" }, success: true });
   }) as unknown as typeof fetch });
   const activity = new Activity();
-  const tools = instrument(buildTools(() => ({ rc, self: { _id: "bot", username: "bot" } }), "https://chat.example", "all"), activity);
+  const tools = instrument(buildTools(() => ({ rc, self: { _id: "bot", username: "bot" }, url: "https://chat.example", fallback: "all" })), activity);
   const args = { room: "room", filename: "screen.png", mime_type: "image/png", data_base64: png, text: "screen", thread_id: "thread" };
   const connection = { id: "test" } as any;
   expect(await tools.send_image!.handler(args, connection)).toEqual({ sent: true, message_id: "sent", room_id: "room" });

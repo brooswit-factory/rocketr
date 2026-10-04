@@ -91,6 +91,12 @@ export class Watcher {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
   private failures = 0;
+  private lastSuccessAt: Date | undefined;
+
+  /** Stream health for the observer app (FACTORY-644): never exposes anything but counts and timestamps. */
+  health(): { running: boolean; consecutiveFailures: number; lastSuccessAt: string | null } {
+    return { running: this.running, consecutiveFailures: this.failures, lastSuccessAt: this.lastSuccessAt?.toISOString() ?? null };
+  }
 
   constructor(private readonly rc: Source, private readonly o: WatcherOptions) {
     this.startedAt = (o.now ?? (() => new Date()))();
@@ -126,6 +132,7 @@ export class Watcher {
         await this.tick();
         if (this.failures) this.o.log?.(`poll recovered after ${this.failures} failure(s)`);
         this.failures = 0;
+        this.lastSuccessAt = (this.o.now ?? (() => new Date()))();
       } catch (err) {
         this.failures++;
         if (this.failures === 1 || this.failures % 20 === 0) this.o.log?.(`poll failed (${this.failures}x): ${(err as Error).message}`);

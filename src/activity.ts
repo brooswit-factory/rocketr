@@ -1,11 +1,14 @@
 import type { Connection, Delivery, Frame } from "@brooswit/thatch";
 
-/** Headers safe to show in the web app. Everything else (authorization, cookie, ...) stays in thatch. */
-const SHOWN_HEADERS = ["x-agent-name", "x-rocketr-account", "user-agent"] as const;
+/** Headers safe to show in the web app. The credential headers (x-rocketr-url/user-id/token) and
+ * everything else never leave this allowlist — see redact.ts, which this mirrors. */
+const SHOWN_HEADERS = ["x-agent-name", "x-rocketr-channel", "user-agent"] as const;
 
 export interface AgentView {
   id: string;
   name: string;
+  /** The Rocket.Chat username this session speaks as, from `/me` — never a client-claimed header. */
+  username: string;
   headers: Record<string, string>;
   connectedAt: number;
   calls: number;
@@ -45,10 +48,10 @@ export class Activity {
     return e;
   }
 
-  connected(c: Connection) {
+  connected(c: Connection, username: string) {
     const headers: Record<string, string> = {};
     for (const h of SHOWN_HEADERS) if (c.headers[h]) headers[h] = c.headers[h];
-    return this.record({ type: "connect", agent: { id: c.id, name: agentName(c), headers, connectedAt: c.connectedAt, calls: 0 } });
+    return this.record({ type: "connect", agent: { id: c.id, name: agentName(c), username, headers, connectedAt: c.connectedAt, calls: 0 } });
   }
 
   toolCall(agentId: string, tool: string, args: unknown, ok: boolean, result: unknown, ms: number) {

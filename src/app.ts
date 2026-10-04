@@ -1,228 +1,284 @@
 import { Elysia, type AnyElysia } from "elysia";
 import { thatch, type Connection, type Frame, type McpHandle } from "@brooswit/thatch";
 import type { Config } from "./config.js";
-import { RocketChat, RocketChatError, type Subscription, type User } from "./rocketchat.js";
+import type { Subscription } from "./rocketchat.js";
 import { Batcher, Watcher, toFrame, type InboundEvent } from "./watcher.js";
-import { Activity } from "./activity.js";
-import { buildTools, instrument } from "./tools.js";
+import { buildTools, instrument, type AccountHandle } from "./tools.js";
 import { Presence } from "./presence.js";
 import { page } from "./web.js";
-import { createAuthenticator, isLoopbackAddress, isLoopbackHost, type RateLimitOptions } from "./auth.js";
+import { Activity } from "./activity.js";
+import { isLoopbackAddress } from "./auth.js";
+import { isBindAllowed } from "./bind.js";
+import { realClientIP } from "./forwarded.js";
+import { parseConnectionHeaders, isHeaderError, connectionCredentials } from "./headers.js";
+import { credentialKey, CredentialRejected, SessionManager, type Session } from "./session.js";
+import { allowAll, type AccessContext, type CheckAccess } from "./access.js";
+import { ConnectionLimiter, ToolCallLimiter, RequestCounters, DEFAULT_LIMITS, type LimitsOptions } from "./limits.js";
+import { redactHeaders, targetHost } from "./redact.js";
+import type { FetchLimits, Resolver } from "./ssrf.js";
 
-export const VERSION = "0.3.0";
-/**
- * Undelivered frames kept per account for sessions that connect later. Per account, so an account with no live
- * session (whose rooms are all at `all`) can't push out frames meant for an agent that is listening.
- */
+export const VERSION = "1.0.0";
+
+/** Undelivered frames kept per credential key for sessions that connect later. */
 const PENDING_MAX = 50;
 /** A room that never goes quiet still gets a turn every this many batch windows. */
 const BATCH_MAX_FACTOR = 5;
-/** The header a connection names its Rocket.Chat account with. Required: there is no default account. */
-export const ACCOUNT_HEADER = "x-rocketr-account";
-
-export interface Account {
-  rc: RocketChat;
-  self: User;
-  watcher: Watcher;
-}
+/** How long a session with zero live connections is kept (watcher running, queue intact) before teardown. */
+const DEFAULT_GRACE_PERIOD_MS = 2 * 60 * 1000;
+/** How long a credential key that got a 401 is refused outright, no network call made. */
+const DEFAULT_BACKOFF_MS = 60 * 1000;
+/** Requests/hour from one source IP before an ALERT log line fires. */
+const DEFAULT_ALERT_THRESHOLD_PER_IP = 20_000;
+/** Server-injected only (auth() always overwrites it; a client-sent value for it is never trusted) — carries the resolved client IP from auth() to the "connect" handler, which only sees headers, with no race against concurrent connections. */
+const INTERNAL_IP_HEADER = "x-rocketr-internal-ip";
 
 export interface Pending {
-  /** Username of the account the message was addressed to; only its sessions may receive it. */
-  account: string;
+  /** Credential key the message was addressed to; only its sessions may receive it. */
+  key: string;
   frame: Frame;
-}
-
-/** A configured account excluded from service at startup, and why. */
-export interface AccountFailure {
-  /** The name configured in ROCKETR_ACCOUNTS — not necessarily the server's own username for it. */
-  name: string;
-  /** Human-readable: a username mismatch (names the server's actual username) or a 401. */
-  detail: string;
-}
-
-/**
- * One consolidated message naming every failed account, so a reader can tell a coordinated rename
- * (many accounts, consistent pattern) apart from a single broken one. Shared by the "some accounts
- * failed" log line and the "every account failed" thrown error, so the two cases never diverge.
- */
-function describeAccountFailures(failures: AccountFailure[], total: number): string {
-  const lines = failures.map((f) => `  - "${f.name}": ${f.detail}`).join("\n");
-  return [
-    `rocketr: ${failures.length} of ${total} configured account(s) failed startup preflight:`,
-    lines,
-    `Update ROCKETR_ACCOUNTS/secrets.env to match the current server-side usernames, or fix the token(s).`,
-  ].join("\n");
 }
 
 export interface Rocketr {
   app: AnyElysia;
   mcp: McpHandle;
-  /** Keyed by Rocket.Chat username. Only accounts that passed the startup preflight. */
-  accounts: Map<string, Account>;
-  /** Configured accounts excluded at startup (username mismatch or 401), with why. */
-  excludedAccounts: AccountFailure[];
   activity: Activity;
-  /** Frames waiting for a session of their account with a live channel stream. */
   pending: Pending[];
   /** Try to push every pending frame; returns how many landed somewhere. */
   deliver(): Promise<number>;
   listen(): Promise<{ port: number }>;
   stop(): Promise<void>;
+  /** Test/observability hook: the live in-memory sessions. */
+  sessions(): Session[];
 }
 
-export async function createRocketr(cfg: Config, deps: {
+export interface CreateRocketrDeps {
+  /** Test-only: replaces the SSRF-guarded fetch entirely (e.g. to point at a fake Rocket.Chat). Never set in production. */
   fetch?: typeof fetch;
   presence?: (options: ConstructorParameters<typeof Presence>[0]) => Pick<Presence, "setListening" | "stop">;
-  /** Source address of an incoming request, for rate limiting and the observer app's loopback guard. Default: the real peer via Bun. */
+  /** Source address of an incoming request, before X-Forwarded-For resolution. Default: the real peer via Bun. */
   requestIP?: (req: Request) => string | undefined;
-  authRateLimit?: RateLimitOptions;
-} = {}): Promise<Rocketr> {
+  checkAccess?: CheckAccess;
+  limits?: Partial<LimitsOptions>;
+  gracePeriodMs?: number;
+  backoffMs?: number;
+  fetchLimits?: FetchLimits;
+  resolver?: Resolver;
+  alertThresholdPerIP?: number;
+}
+
+export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): Promise<Rocketr> {
   const activity = new Activity();
   const log = (message: string) => { console.error(`rocketr: ${message}`); activity.record({ type: "log", message }); };
+  const logRefusal = (ip: string, reason: string) => log(`refused connection ip=${ip} reason=${reason}`);
 
   // Secure by default: enforced here too (not just in loadConfig) so a Config built directly can't skip it.
-  if (!isLoopbackHost(cfg.host)) {
-    const bare = cfg.accounts.filter((a) => !a.clientSecret).map((a) => a.name);
-    if (bare.length) {
-      throw new Error(`rocketr: host "${cfg.host}" is not loopback, but account(s) without a client secret would be reachable unauthenticated: ${bare.map((n) => `"${n}"`).join(", ")}`);
-    }
-  }
+  if (!isBindAllowed(cfg.host)) throw new Error(`rocketr: host "${cfg.host}" is not loopback, the tailnet range, or a ULA address`);
 
-  const accounts = new Map<string, Account>();
+  const checkAccess = deps.checkAccess ?? allowAll;
+  const limitsOptions: LimitsOptions = { ...DEFAULT_LIMITS, ...deps.limits };
+  const limiter = new ConnectionLimiter(limitsOptions);
+  const toolLimiter = new ToolCallLimiter({ maxPerMinute: limitsOptions.toolCallsPerMinutePerConnection });
+  const counters = new RequestCounters({ perIPAlertThreshold: deps.alertThresholdPerIP ?? DEFAULT_ALERT_THRESHOLD_PER_IP, log });
+
   const pending: Pending[] = [];
   const presences = new Map<string, Pick<Presence, "setListening" | "stop">>();
+  const batchers = new Map<string, Batcher>();
   let delivering = Promise.resolve(0);
 
-  // Every configured account is checked, even after an earlier one fails: stopping at the first
-  // failure would only ever name that one account, leaving a reader unable to tell a coordinated
-  // rename (many accounts, consistent pattern) apart from a single broken one.
-  const clients: Array<{ rc: RocketChat; self: User }> = [];
-  const failures: AccountFailure[] = [];
-  for (const a of cfg.accounts) {
-    const rc = new RocketChat({ url: cfg.url, userId: a.userId, token: a.token, ...(deps.fetch ? { fetch: deps.fetch } : {}) });
-    let self: User;
+  const adopt = async (session: Session, sub: Subscription) => {
+    if (sub.desktopNotifications || sub.disableNotifications !== undefined) return;
     try {
-      self = await rc.me();
+      await session.rc.saveNotification(sub.rid, session.options.notify);
+      sub.desktopNotifications = session.options.notify;
+      log(`@${session.self.username}: ${sub.fname || sub.name} notifications set to ${session.options.notify}`);
     } catch (err) {
-      const status = err instanceof RocketChatError ? err.status : undefined;
-      failures.push({ name: a.name, detail: status === 401 ? "401 Unauthorized — token rejected" : `preflight failed: ${(err as Error).message}` });
-      continue;
+      log(`@${session.self.username}: cannot set notifications for ${sub.fname || sub.name}: ${(err as Error).message}`);
     }
-    // The header names the account by username, so a name that doesn't match its token would be a lie:
-    // never serve it under the name it claims. It is excluded below, not thrown — one drifted account
-    // must not take every other, healthy account down with it.
-    if (self.username !== a.name) {
-      failures.push({ name: a.name, detail: `signs in as @${self.username}, not @${a.name}` });
-      continue;
-    }
-    clients.push({ rc, self });
-    presences.set(self.username, (deps.presence ?? ((options) => new Presence(options)))({
-      url: cfg.url, userId: a.userId, token: a.token,
-      log: (message) => log(`@${self.username}: ${message}`),
+  };
+
+  const onCreateSession = (session: Session) => {
+    const key = session.key;
+    const batcher = new Batcher({
+      quietMs: session.options.batchMs,
+      maxMs: session.options.batchMs * BATCH_MAX_FACTOR,
+      flush: async (events) => {
+        const frame = toFrame(events);
+        frame.meta.account = session.self.username;
+        activity.record({ type: "inbound", frame });
+        pending.push({ key, frame });
+        const own = pending.filter((p) => p.key === key);
+        if (own.length > PENDING_MAX) {
+          pending.splice(pending.indexOf(own[0]!), 1);
+          log(`@${session.self.username}: dropped undelivered message ${own[0]!.frame.meta.message_id} (queue full)`);
+        }
+        await deliver();
+      },
+    });
+    batchers.set(key, batcher);
+
+    const watcher = new Watcher(session.rc, {
+      self: session.self,
+      fallback: session.options.notify,
+      pollMs: session.options.pollMs,
+      // The lookback window is applied once, here, by back-dating the watcher's own start time —
+      // everything else about "restarts never replay history" is unchanged.
+      now: () => new Date(Date.now() - session.options.lookbackSec * 1000),
+      log: (m) => log(`@${session.self.username}: ${m}`),
+      onSubscription: (sub) => adopt(session, sub),
+      onEvent: async (e) => { await batcher.add([key, e.room.id, e.message.tmid ?? ""].join("\0"), e); },
+    });
+    session.watcher = watcher;
+    watcher.start();
+
+    presences.set(key, (deps.presence ?? ((options) => new Presence(options)))({
+      url: session.creds.url, userId: session.creds.userId, token: session.creds.token,
+      log: (message) => log(`@${session.self.username}: ${message}`),
     }));
-  }
 
-  if (failures.length) {
-    const message = describeAccountFailures(failures, cfg.accounts.length);
-    if (failures.length === cfg.accounts.length) {
-      // Every configured account failed: zero accounts would be served. Reporting "healthy" while
-      // serving nothing would be its own silent failure, so this exits non-zero on purpose —
-      // deliberately keeping the crash/restart signal for a config that serves nobody. Because that
-      // re-triggers the restart loop, this is the SAME message (via describeAccountFailures) that a
-      // partial failure only logs: whichever path runs, the journal gets one consolidated, actionable
-      // line. Restarting fast against a mistake that a human hasn't fixed yet is unhelpful noise, so
-      // systemd/rocketr.service's RestartSec/RestartSteps back off progressively instead of a flat 5s.
-      throw new Error(message);
-    }
-    log(message);
-  }
-
-  /**
-   * Give a room that never had a preference saved the agent default, so it shows (and can be changed) in Rocket.Chat's
-   * own UI. A room someone explicitly reset to "default" is left alone.
-   */
-  const adopt = async (rc: RocketChat, self: User, sub: Subscription) => {
-    const migrate = cfg.migrateLegacyAllToMentions && sub.desktopNotifications === "all";
-    if (!migrate && (sub.desktopNotifications || sub.disableNotifications !== undefined)) return;
-    const level = migrate ? "mentions" : cfg.defaultNotifications;
-    try {
-      await rc.saveNotification(sub.rid, level);
-      sub.desktopNotifications = level;
-      log(`@${self.username}: ${sub.fname || sub.name} notifications set to ${level}`);
-    } catch (err) {
-      log(`@${self.username}: cannot set notifications for ${sub.fname || sub.name}: ${(err as Error).message}`);
-    }
-  };
-  for (const { rc, self } of clients) {
-    try { for (const sub of await rc.subscriptions()) await adopt(rc, self, sub); }
-    catch (err) { log(`@${self.username}: cannot list rooms: ${(err as Error).message}`); }
-  }
-
-  /** The account a connection named, or the bridge's opt-in default when it named none. */
-  const nameOf = (header: string | null | undefined) => header || cfg.defaultAccount || "";
-  const accountOf = (c: Connection): Account => {
-    const a = accounts.get(nameOf(c.headers[ACCOUNT_HEADER]));
-    if (!a) throw new Error(`this session has no Rocket.Chat account (set the ${ACCOUNT_HEADER} header)`);
-    return a;
+    void (async () => {
+      try { for (const sub of await session.rc.subscriptions()) await adopt(session, sub); }
+      catch (err) { log(`@${session.self.username}: cannot list rooms: ${(err as Error).message}`); }
+    })();
   };
 
-  // `app` is assigned below (Elysia needs the thatch plugin to exist first) but these closures are only
+  const onTeardownSession = (session: Session) => {
+    void batchers.get(session.key)?.flushAll();
+    batchers.delete(session.key);
+    presences.get(session.key)?.stop();
+    presences.delete(session.key);
+    log(`@${session.self.username}: session torn down (idle grace period elapsed)`);
+  };
+
+  const sessions = new SessionManager({
+    gracePeriodMs: deps.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS,
+    backoffMs: deps.backoffMs ?? DEFAULT_BACKOFF_MS,
+    fetchLimits: deps.fetchLimits,
+    resolver: deps.resolver,
+    ...(deps.fetch ? { fetchOverride: deps.fetch } : {}),
+    onCreate: onCreateSession,
+    onTeardown: onTeardownSession,
+  });
+
+  // `app` is assigned below (Elysia needs the thatch plugin to exist first) but this closure is only
   // ever called per-request, long after that assignment — by then the capture is live, not a TDZ read.
   const requestIP: (req: Request) => string | undefined = deps.requestIP ?? ((req) => app.server?.requestIP(req)?.address ?? undefined);
-  const secretOf = new Map(cfg.accounts.map((a) => [a.name, a.clientSecret] as const));
-  const loopbackBind = isLoopbackHost(cfg.host);
-  const authenticate = createAuthenticator({
-    known: (name) => accounts.has(name),
-    secretOf: (name) => secretOf.get(name),
-    loopbackBind,
-    allowUnauthenticatedLoopback: cfg.allowUnauthenticatedLoopback,
-    requestIP,
-    onUnauthenticatedLoopback: (name) => log(`@${name}: connected with no client credential (ROCKETR_ALLOW_UNAUTHENTICATED_LOOPBACK) — set ROCKETR_ACCOUNT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_CLIENT_SECRET to require one`),
-    onRefused: ({ account, ip, reason }) => log(`refused account=${account} ip=${ip} reason=${reason}`),
-    ...(deps.authRateLimit ? { rateLimit: deps.authRateLimit } : {}),
-  });
-  /** The observer app (/, /api/snapshot, /api/stream) has no per-account auth — it shows every account's
-   * activity, including message content — so it stays loopback-only regardless of client secrets or ROCKETR_HOST. */
-  const observerGuard = (req: Request): Response | null => isLoopbackAddress(requestIP(req))
-    ? null
-    : new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: { "content-type": "application/json" } });
+
+  /**
+   * The only place `auth` ever runs against a client-named Rocket.Chat server: validates headers,
+   * applies the always-on limits, calls `checkAccess` (once for the connection, and again for a
+   * brand-new credential key), then creates/reuses the session — which is itself where the SSRF
+   * guard's `/me` preflight happens. Everything here either refuses (false, logged, no state
+   * created) or accepts and leaves the connection's refcount already incremented.
+   */
+  const auth = async (req: Request): Promise<boolean> => {
+    const peer = requestIP(req);
+    const ip = realClientIP(peer, req.headers.get("x-forwarded-for"));
+    // Stashed on the request's own Headers so the "connect" event — which only ever sees headers,
+    // never the original Request — can read it with no race against a concurrent connection's auth().
+    req.headers.set(INTERNAL_IP_HEADER, ip);
+
+    const headerRecord: Record<string, string> = {};
+    req.headers.forEach((v, k) => { headerRecord[k] = v; });
+
+    const parsed = parseConnectionHeaders(headerRecord);
+    if (isHeaderError(parsed)) { logRefusal(ip, `invalid-credentials: header ${parsed.field} ${parsed.message}`); return false; }
+
+    if (!limiter.canConnect(ip)) { logRefusal(ip, "limit-exceeded: too many connections from this source IP"); return false; }
+
+    const key = credentialKey(parsed);
+    const ctxBase: Omit<AccessContext, "event"> = { sourceIP: ip, headers: redactHeaders(headerRecord), targetUrl: parsed.url, credentialKeyHash: key };
+
+    const connDecision = await checkAccess({ ...ctxBase, event: "connection" });
+    if (!connDecision.allow) { logRefusal(ip, `checkAccess denied the connection: ${connDecision.reason}`); return false; }
+
+    if (!limiter.canUseKey(ip, key)) { logRefusal(ip, "limit-exceeded: too many distinct credential keys"); return false; }
+
+    if (sessions.isNewKey(key)) {
+      const keyDecision = await checkAccess({ ...ctxBase, event: "new-key" });
+      if (!keyDecision.allow) { logRefusal(ip, `checkAccess denied the new credential key: ${keyDecision.reason}`); return false; }
+    }
+
+    try {
+      await sessions.acquire(
+        { url: parsed.url, userId: parsed.userId, token: parsed.token },
+        { notify: parsed.notify, batchMs: parsed.batchMs, pollMs: parsed.pollMs, lookbackSec: parsed.lookbackSec },
+      );
+    } catch (err) {
+      if (err instanceof CredentialRejected) { logRefusal(ip, `${err.reason}: ${err.message}`); return false; }
+      logRefusal(ip, `error validating credential: ${(err as Error).message}`);
+      return false;
+    }
+
+    limiter.addConnection(ip, key);
+    return true;
+  };
+
+  const accountOf = (c: Connection): AccountHandle => {
+    const key = credentialKey(connectionCredentials(c.headers));
+    const session = sessions.get(key);
+    if (!session) throw new Error("this session's Rocket.Chat credential is no longer active (reconnect to restart it)");
+    return { rc: session.rc, self: session.self, url: session.creds.url, fallback: session.options.notify };
+  };
+
+  /** Request-volume counters (always on) and the per-connection tool-call rate limit, around every tool call. */
+  const guardTools = (tools: ReturnType<typeof buildTools>) => Object.fromEntries(Object.entries(tools).map(([name, def]) => [name, {
+    ...def,
+    handler: async (args: unknown, c: Connection) => {
+      const ip = c.headers[INTERNAL_IP_HEADER] || "unknown";
+      counters.record(ip, targetHost(c.headers["x-rocketr-url"] ?? ""));
+      if (!toolLimiter.allow(c.id)) throw new Error("tool-call rate limit exceeded for this connection; slow down");
+      return def.handler(args as never, c);
+    },
+  }]));
 
   const { plugin, mcp } = thatch({
     serverInfo: { name: "rocketr", version: VERSION },
-    // No fallback account unless ROCKETR_DEFAULT_ACCOUNT opts a single-account bridge in: a client that
-    // doesn't name a known one is refused at connect.
-    auth: (req) => authenticate(req, nameOf(req.headers.get(ACCOUNT_HEADER))),
-    tools: instrument(buildTools(accountOf, cfg.url, cfg.defaultNotifications, (account, roomId, level) => {
+    auth,
+    tools: instrument(guardTools(buildTools(accountOf, (account, roomId, level) => {
       if (level !== "nothing") return;
       for (const item of [...pending]) {
-        if (item.account === account && item.frame.meta.room_id === roomId) pending.splice(pending.indexOf(item), 1);
+        if (item.frame.meta.room_id === roomId) {
+          const session = sessions.get(item.key);
+          if (session?.self.username === account) pending.splice(pending.indexOf(item), 1);
+        }
       }
-    }, { dir: cfg.attachmentDir, maxBytes: cfg.attachmentMaxBytes, allowedTypes: cfg.attachmentTypes }), activity),
+    }, { dir: cfg.attachmentDir, maxBytes: cfg.attachmentMaxBytes, allowedTypes: cfg.attachmentTypes })), activity),
   });
+
   const syncPresence = (c: Connection) => {
-    const account = nameOf(c.headers[ACCOUNT_HEADER]);
-    presences.get(account)?.setListening(mcp.connections.filter((session) =>
-      nameOf(session.headers[ACCOUNT_HEADER]) === account && session.headers["x-rocketr-channel"] === "on").length > 0);
+    const key = credentialKey(connectionCredentials(c.headers));
+    presences.get(key)?.setListening(mcp.connections.filter((conn) =>
+      credentialKey(connectionCredentials(conn.headers)) === key && conn.headers["x-rocketr-channel"] === "on").length > 0);
   };
-  mcp.on("connect", (c) => { activity.connected(c); syncPresence(c); });
+  mcp.on("connect", (c) => {
+    const key = credentialKey(connectionCredentials(c.headers));
+    const session = sessions.get(key);
+    activity.connected(c, session?.self.username ?? "?");
+    syncPresence(c);
+  });
   mcp.on("disconnect", (c, reason) => {
     activity.record({ type: "disconnect", agentId: c.id, reason });
+    const ip = c.headers[INTERNAL_IP_HEADER] || "unknown";
+    const key = credentialKey(connectionCredentials(c.headers));
+    sessions.release(key);
+    limiter.removeConnection(ip, key);
+    toolLimiter.forget(c.id);
     syncPresence(c);
   });
 
   /**
-   * Pushes are opt-in (`x-rocketr-channel: on`) and go only to sessions of the addressed account. Claude Code
-   * accepts a frame on the wire even when the session wasn't started with the channel flag, then drops it
-   * silently — so a tools-only session must never count as a delivery, or the message is marked read and lost.
+   * Pushes are opt-in (`x-rocketr-channel: on`) and go only to sessions of the addressed credential
+   * key. Claude Code accepts a frame on the wire even when the session wasn't started with the
+   * channel flag, then drops it silently — so a tools-only session must never count as a delivery.
    */
-  const listening = (account: string) => mcp.connections
-    .filter((c) => c.headers["x-rocketr-channel"] === "on" && nameOf(c.headers[ACCOUNT_HEADER]) === account)
+  const listening = (key: string) => mcp.connections
+    .filter((c) => c.headers["x-rocketr-channel"] === "on" && credentialKey(connectionCredentials(c.headers)) === key)
     .sort((a, b) => b.connectedAt - a.connectedAt)[0];
 
   const deliverOnce = async () => {
     let landed = 0;
     for (const item of [...pending]) {
-      const target = listening(item.account);
+      const target = listening(item.key);
       if (!target) continue;
       const delivery = await target.send(item.frame);
       activity.record({ type: "push", agentId: target.id, messageId: item.frame.meta.message_id ?? "", delivery });
@@ -230,56 +286,35 @@ export async function createRocketr(cfg: Config, deps: {
       pending.splice(pending.indexOf(item), 1);
       landed++;
       const rid = item.frame.meta.room_id;
-      if (rid) await accounts.get(item.account)!.rc.markRead(rid).catch((err) => log(`markRead: ${(err as Error).message}`));
+      const session = sessions.get(item.key);
+      if (rid && session) await session.rc.markRead(rid).catch((err) => log(`markRead: ${(err as Error).message}`));
     }
     return landed;
   };
   // serialize: the watchers and the retry timer must not push the same frame twice
   const deliver = () => (delivering = delivering.then(deliverOnce, deliverOnce));
 
-  /** Which account each event was addressed to (events themselves don't carry it). */
-  const accountOfEvent = new WeakMap<InboundEvent, string>();
-  const batcher = new Batcher({
-    quietMs: cfg.batchMs, maxMs: cfg.batchMs * BATCH_MAX_FACTOR,
-    flush: async (events) => {
-      const frame = toFrame(events);
-      const account = frame.meta.account = accountOfEvent.get(events[0]!)!;
-      activity.record({ type: "inbound", frame });
-      pending.push({ account, frame });
-      const own = pending.filter((p) => p.account === account);
-      if (own.length > PENDING_MAX) {
-        pending.splice(pending.indexOf(own[0]!), 1);
-        log(`@${account}: dropped undelivered message ${own[0]!.frame.meta.message_id} (queue full)`);
-      }
-      await deliver();
-    },
-  });
-
-  for (const { rc, self } of clients) {
-    const watcher = new Watcher(rc, {
-      self, fallback: cfg.defaultNotifications, pollMs: cfg.pollMs, log,
-      onSubscription: (sub) => adopt(rc, self, sub),
-      onEvent: async (e) => {
-        accountOfEvent.set(e, self.username);
-        await batcher.add([self.username, e.room.id, e.message.tmid ?? ""].join("\0"), e);
-      },
-    });
-    accounts.set(self.username, { rc, self, watcher });
-  }
+  /** The observer app (/, /api/snapshot, /api/stream) has no per-account auth of its own — it shows
+   * every session's activity, including message content — so it stays loopback-only unconditionally. */
+  const observerGuard = (req: Request): Response | null => isLoopbackAddress(requestIP(req))
+    ? null
+    : new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: { "content-type": "application/json" } });
 
   const app: AnyElysia = new Elysia()
     .use(plugin)
     .get("/", ({ request }) => observerGuard(request) ?? new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } }))
     .get("/api/snapshot", ({ request }) => observerGuard(request) ?? ({
-      accounts: [...accounts.values()].map((a) => ({ id: a.self._id, username: a.self.username })),
-      // So a partial outage never reads as "all healthy": named explicitly, not just absent from `accounts`.
-      excludedAccounts: failures,
-      server: cfg.url,
+      sessions: sessions.list().map((s) => ({
+        keyHash: s.key.slice(0, 12),
+        username: s.self.username,
+        connections: s.refCount,
+        health: s.watcher?.health() ?? null,
+      })),
       version: VERSION,
       pending: pending.length,
-      // Counts only: enough to diagnose a stalled account without exposing message contents.
-      pendingByAccount: pending.reduce<Record<string, number>>((counts, item) => {
-        counts[item.account] = (counts[item.account] ?? 0) + 1;
+      pendingByKey: pending.reduce<Record<string, number>>((counts, item) => {
+        const short = item.key.slice(0, 12);
+        counts[short] = (counts[short] ?? 0) + 1;
         return counts;
       }, {}),
       ...activity.snapshot(),
@@ -301,19 +336,18 @@ export async function createRocketr(cfg: Config, deps: {
 
   let retry: ReturnType<typeof setInterval> | undefined;
   return {
-    app, mcp, accounts, excludedAccounts: failures, activity, pending, deliver,
+    app, mcp, activity, pending, deliver,
+    sessions: () => sessions.list(),
     async listen() {
       app.listen({ hostname: cfg.host, port: cfg.port, idleTimeout: 0 });
-      for (const a of accounts.values()) a.watcher.start();
-      retry = setInterval(() => { if (pending.length) void deliver(); }, Math.max(cfg.pollMs, 1000));
-      log(`listening on http://${cfg.host}:${app.server!.port} as ${[...accounts.keys()].map((u) => `@${u}`).join(", ")}` +
-        (failures.length ? ` (excluding ${failures.length} account(s): ${failures.map((f) => `"${f.name}"`).join(", ")} — see the startup preflight error above)` : ""));
+      retry = setInterval(() => { if (pending.length) void deliver(); }, 1000);
+      log(`listening on http://${cfg.host}:${app.server!.port} (stateless proxy mode: no accounts configured, credentials are client-carried)`);
       return { port: app.server!.port! };
     },
     async stop() {
-      for (const a of accounts.values()) a.watcher.stop();
       if (retry) clearInterval(retry);
-      await batcher.flushAll();
+      for (const batcher of batchers.values()) await batcher.flushAll();
+      sessions.stopAll();
       await mcp.closeAll();
       for (const presence of presences.values()) presence.stop();
       await app.stop(true); // close open observer streams too

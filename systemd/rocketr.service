@@ -1,6 +1,7 @@
 [Unit]
-Description=rocketr — Rocket.Chat bridge for Claude Code (thatch MCP server + channel + observer web app)
-# Needs the network to reach Rocket.Chat; the watcher backs off and retries while it is down.
+Description=rocketr — stateless Rocket.Chat proxy for Claude Code (thatch MCP server + channel + observer web app)
+# Needs the network to reach whatever Rocket.Chat server each client's connection names; a
+# watcher backs off and retries while its own target is down.
 After=network-online.target
 Wants=network-online.target
 
@@ -8,19 +9,30 @@ Wants=network-online.target
 Type=simple
 # bun is often outside the user manager's default PATH (e.g. ~/.bun/bin).
 Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-# Credentials are read from ~/.config/rocketchat/secrets.env (override with ROCKETR_ENV_FILE).
+# No config file and no account registry: every connection carries its own Rocket.Chat URL and
+# credentials in headers (see README.md "Connection headers"). The only settings left are the
+# bind address/port below — ROCKETR_HOST/ROCKETR_PORT, defaulting to loopback-only. In this
+# deployment TLS termination and the only public listener are Caddy's job; rocketr itself stays
+# loopback-bound (its own bind guard refuses anything else) and Caddy reverse-proxies to it.
 # ExecStart is a TEMPLATE: scripts/install.sh substitutes both placeholders with this
 # machine's resolved bun and clone paths, escaped for systemd's quoting rules.
 ExecStart="@@BUN_PATH@@" run "@@REPO_ROOT@@/src/index.ts"
 Restart=on-failure
-# A misconfigured account (or all of them) failing preflight is a config problem a human has to fix,
-# not a transient blip — hammering it every 5s is pure noise. Back off progressively instead: 5s, then
+# Nothing is preflighted at startup any more (there's no account registry to check) — a bad bind
+# address is the one way this still fails fast and keeps failing (the bind guard refuses to start).
+# Back off progressively rather than hammering a config problem a human has to fix: 5s, then
 # growing over RestartSteps attempts up to RestartMaxDelaySec, so the interval a person sees in
-# `journalctl` slows down the longer the daemon has been failing. (Requires systemd >= 254; on an older
-# systemd these two keys are ignored with a warning and RestartSec's flat 5s still applies.)
+# `journalctl` slows down the longer the daemon has been failing. (Requires systemd >= 254; on an
+# older systemd these two keys are ignored with a warning and RestartSec's flat 5s still applies.)
 RestartSec=5
 RestartSteps=5
 RestartMaxDelaySec=60
 
 [Install]
 WantedBy=default.target
+
+# Kill switch: `systemctl --user stop <this unit's installed name>` — one command. Connected
+# clients get connection errors; any other rocketr instance this proxy is meant to replace is
+# untouched and keeps serving, since this never stops anything but itself.
+# Rollback: stop this unit, then point each client's connection headers back at whatever instance
+# served it before (a per-client config change) — nothing else needs restarting.

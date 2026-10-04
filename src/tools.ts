@@ -11,8 +11,8 @@ export { attachmentAllowed, DEFAULT_ATTACHMENT_TYPES as ATTACHMENT_TYPES } from 
 /**
  * `download_attachment`'s "remote" mode returns base64 bytes in the MCP tool result rather than
  * saving to this machine's disk — the only mode useful to an agent that runs on a different
- * machine from rocketr. Capped well under typical MCP result-size limits even after base64's ~4/3
- * inflation (10 MiB raw → ~13.3 MiB encoded).
+ * machine from rocketr (which, as a shared proxy, is every agent now). Capped well under typical
+ * MCP result-size limits even after base64's ~4/3 inflation (10 MiB raw → ~13.3 MiB encoded).
  */
 export const REMOTE_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 
@@ -52,17 +52,17 @@ export async function resolveRoom(rc: RocketChat, ref: string): Promise<Room> {
   try { return await rc.roomById(ref); } catch { return rc.roomByName(ref); }
 }
 
-/** What a tool needs from the account a connection is bound to. */
-export interface AccountHandle { rc: RocketChat; self: User }
+/** What a tool needs from the account a connection is bound to — its own Rocket.Chat client/identity/URL, and the notification fallback for rooms with no saved preference. */
+export interface AccountHandle { rc: RocketChat; self: User; url: string; fallback: NotifyLevel }
 
 export type NotificationChange = (account: string, roomId: string, level: NotifyLevel) => void;
 
-export function buildTools(accountOf: (c: Connection) => AccountHandle, url: string, fallback: NotifyLevel, onNotificationChange?: NotificationChange, attachments?: AttachmentOptions): Record<string, ToolDef<any>> {
+export function buildTools(accountOf: (c: Connection) => AccountHandle, onNotificationChange?: NotificationChange, attachments?: AttachmentOptions): Record<string, ToolDef<any>> {
   return {
     whoami: tool({
-      description: "The Rocket.Chat account this session speaks as (chosen by its x-rocketr-account header).",
+      description: "The Rocket.Chat account this session speaks as (the identity its client-carried credentials resolve to via /me).",
       input: {},
-      handler: (_a, c) => { const { self } = accountOf(c); return { user_id: self._id, username: self.username, server: url }; },
+      handler: (_a, c) => { const { self, url } = accountOf(c); return { user_id: self._id, username: self.username, server: url }; },
     }),
     list_rooms: tool({
       description: "Rooms this session's account is in, with unread and mention counts.",
@@ -201,7 +201,7 @@ export function buildTools(accountOf: (c: Connection) => AccountHandle, url: str
         "all = every message; mentions = DMs, @mentions and replies in threads you follow; nothing = none.",
       input: { room: ROOM },
       handler: async ({ room }, c) => {
-        const { rc } = accountOf(c);
+        const { rc, fallback } = accountOf(c);
         const sub = await rc.subscription((await resolveRoom(rc, room))._id);
         return { room_id: sub.rid, name: sub.fname || sub.name, level: levelOf(sub, fallback), saved: sub.desktopNotifications ?? null, muted: !!sub.disableNotifications };
       },
