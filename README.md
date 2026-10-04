@@ -59,16 +59,24 @@ outright (no network call at all) for a backoff window, rather than hammering a 
 rocketr connects wherever the client's `x-rocketr-url` says, which makes it an open relay unless
 every outbound request is independently checked — never just checked once and trusted afterward:
 
-- **https only.** No plain HTTP, no exceptions.
+- **https only, port 443 only.** No plain HTTP, no exceptions, and no client-chosen port — an
+  arbitrary port would be a TLS-handshake probe primitive against any host reachable from the box.
+- **No IP-literal hostnames.** Refused outright and explicitly — not merely because a DNS resolver
+  happens to return nothing for one — since no valid Rocket.Chat TLS certificate is ever issued for
+  a bare IP address.
 - rocketr resolves the hostname **itself** and checks **every** returned A/AAAA record against a
   compiled-in deny list: loopback, RFC1918, link-local (including the cloud metadata address
-  `169.254.169.254`), CGNAT (`100.64.0.0/10`), `::1`, `fc00::/7`, `fe80::/10`, IPv4-mapped IPv6,
-  `0.0.0.0/8`, and multicast. If any one resolved address is denied, the whole request is refused.
+  `169.254.169.254`), CGNAT (`100.64.0.0/10`), `::1`, `fc00::/7`, `fe80::/10`, `0.0.0.0/8`,
+  multicast, the reserved/benchmarking/TEST-NET ranges, and every IPv6 form that can embed an
+  IPv4 address (mapped, the deprecated compatible form, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`,
+  Teredo `2001::/32`) — checked on the 128-bit value, never a textual form, so a resolver's own
+  formatting can't evade it. If any one resolved address is denied, the whole request is refused.
 - The connection is then **pinned** to that checked address — the socket never re-resolves — which
   is what defeats DNS rebinding between the check and the connect.
 - **No redirects, ever.** Any `3xx` response is treated as a failure.
 - Request paths are the fixed `/api/v1/...` set the Rocket.Chat client already uses; responses are
-  capped in size and time out.
+  capped in size, and bounded by an absolute wall-clock deadline — not just an idle timeout, which a
+  server trickling one byte at a time would never trip.
 - The same-origin check on attachment download links (`/file-upload/` and `/ufs/` only, on the
   configured server's own origin) is unchanged from before.
 
@@ -103,12 +111,15 @@ Every refusal — `invalid-credentials`, `blocked-url`, `limit-exceeded`, or a `
 — produces one log line naming the reason, never a secret.
 
 **Counters, not payloads.** Request volume per source IP and per target host is counted in a
-rolling one-hour window, in memory — never request/response bodies or query strings. An `ALERT`
-log line fires once per hour per subject when a source IP's count exceeds a compiled-in threshold
-(default 20,000/hour), and once, ever, the first time a brand-new target host is seen at all — a
-new host contacted at all is exactly the SSRF-probing signal, since legitimate clients only ever
-name the one Rocket.Chat server they're configured for. The log line is the alert surface; forward
-it to whatever paging system you use.
+trailing one-hour window (minute-bucketed, never one entry per request), in memory — never
+request/response bodies or query strings. Both the number of distinct subjects tracked and the
+number of new-target-host `ALERT` lines per hour are themselves capped, so cycling many distinct
+hostnames or source IPs can't grow memory or flood the log without bound — the rest are counted
+into one suppression summary line instead. An `ALERT` fires once per hour per subject when a
+source IP's count exceeds a compiled-in threshold (default 20,000/hour), and for each new target
+host seen, up to that per-hour cap — a new host contacted at all is exactly the SSRF-probing
+signal, since legitimate clients only ever name the one Rocket.Chat server they're configured for.
+The log line is the alert surface; forward it to whatever paging system you use.
 
 ## Bind guard and `X-Forwarded-For`
 
@@ -338,23 +349,17 @@ and [media confirmation API](https://developer.rocket.chat/apidocs/check-uploade
 Both endpoints must be available on the server. Upload and publication errors
 are returned without automatic retries, to avoid duplicate posts.
 
-### Agent online status
+### Agent online status — disabled in this version
 
-An account appears online in Rocket.Chat while at least one MCP session for that
-credential has `x-rocketr-channel: on`. Tools-only sessions do not mark an agent
-online. Multiple channel sessions sharing a credential share one presence connection; closing the last
-one closes it. This indicates a connected agent runtime, not whether a model is
-currently working or its provider is available.
-
-The bridge uses Rocket.Chat's [authenticated realtime connection](https://developer.rocket.chat/apidocs/login-realtime)
-and `UserPresence:online`, answering server pings and sending a heartbeat every
-30 seconds. Presence reconnects after network failures. Closing the bridge's
-socket lets Rocket.Chat clear presence after its normal disconnect timeout,
-including when the bridge crashes. Abrupt MCP disconnects are detected by
-thatch's stale-session cleanup (normally up to 75 seconds after stream detach).
-No persistent manual status is set and the shared account token is never logged
-out or revoked. Dedicated agent accounts should use the normal Online default;
-a manually selected Invisible status can override automatic presence.
+Earlier versions showed an account as online in Rocket.Chat while a channel session was
+connected, by opening a realtime WebSocket to the configured server. In the stateless proxy, that
+URL is client-supplied — and `src/presence.ts`'s WebSocket connect used the system DNS resolver
+directly, bypassing the SSRF guard entirely (a hostname that resolves one way for the guarded
+`/me` call and another way for the WebSocket connect, i.e. DNS rebinding, would get an unguarded,
+unpinned outbound connection to an internal address and port). Rather than ship that gap, presence
+is disabled for this version: no "online" dot, full stop. Fixing it properly (opening the socket
+through the same pinned, deny-checked path as every other outbound connection) is tracked as
+follow-up work, not blocking for this build — see FACTORY-644.
 
 ### Message reactions
 

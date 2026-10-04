@@ -83,8 +83,14 @@ const V4_DENY: Array<[string, number]> = [
   ["127.0.0.0", 8],      // loopback
   ["169.254.0.0", 16],   // link-local, incl. 169.254.169.254 (cloud metadata)
   ["172.16.0.0", 12],    // RFC1918
+  ["192.0.0.0", 24],     // IETF protocol assignments
+  ["192.0.2.0", 24],     // TEST-NET-1
   ["192.168.0.0", 16],   // RFC1918
+  ["198.18.0.0", 15],    // benchmarking
+  ["198.51.100.0", 24],  // TEST-NET-2
+  ["203.0.113.0", 24],   // TEST-NET-3
   ["224.0.0.0", 4],      // multicast
+  ["240.0.0.0", 4],      // reserved
   ["255.255.255.255", 32], // broadcast
 ];
 
@@ -106,17 +112,34 @@ export function matchesCidr(ip: string, base: string, bits: number): boolean {
   return false;
 }
 
-/** True if `ip` (v4 or v6, including an IPv4-mapped IPv6 form) falls in the compiled-in deny list. */
+const MASK32 = 0xffffffffn;
+
+/**
+ * Every IPv4 address embedded in an IPv6 address `v6` might carry, by the schemes that carry one —
+ * checked on the 128-bit VALUE, never a textual form, so it can't be defeated by a resolver
+ * formatting the same address differently (dotted vs. hex mapped notation, for instance).
+ */
+function embeddedV4Candidates(v6: bigint): number[] {
+  const out: number[] = [];
+  const top96 = v6 >> 32n;
+  if (top96 === 0n || top96 === 0xffffn) out.push(Number(v6 & MASK32)); // ::a.b.c.d (compatible, deprecated) and ::ffff:a.b.c.d (mapped)
+  const nat64Prefix = ipv6ToBigInt("64:ff9b::")! >> 32n;
+  if (top96 === nat64Prefix) out.push(Number(v6 & MASK32)); // 64:ff9b::/96 (NAT64)
+  const sixToFourPrefix = v6 >> 112n;
+  if (sixToFourPrefix === 0x2002n) out.push(Number((v6 >> 80n) & MASK32)); // 2002::/16 (6to4): embedded in bits 16-47
+  const teredoPrefix = v6 >> 96n;
+  if (teredoPrefix === 0x20010000n) out.push(Number((v6 & MASK32) ^ MASK32)); // 2001::/32 (Teredo): client v4 XORed with all-ones
+  return out;
+}
+
+/** True if `ip` (v4 or v6, including every scheme an IPv6 address can use to embed an IPv4 one) falls in the compiled-in deny list. */
 export function isDeniedAddress(ip: string): boolean {
   const v4 = ipv4ToInt(ip);
   if (v4 !== null) return V4_DENY.some(([base, bits]) => inV4Cidr(v4, base, bits));
   const v6 = ipv6ToBigInt(ip);
   if (v6 === null) return true; // unparsable — refuse rather than let a malformed record through
   if (V6_DENY.some(([base, bits]) => inV6Cidr(v6, base, bits))) return true;
-  // IPv4-mapped IPv6 (::ffff:a.b.c.d): check the embedded v4 address too.
-  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(ip.split("%")[0]!);
-  if (mapped) { const inner = ipv4ToInt(mapped[1]!); if (inner !== null) return V4_DENY.some(([base, bits]) => inV4Cidr(inner, base, bits)); }
-  return false;
+  return embeddedV4Candidates(v6).some((inner) => V4_DENY.some(([base, bits]) => inV4Cidr(inner, base, bits)));
 }
 
 /** Every A/AAAA record for `hostname`. Throws if DNS returns no usable records at all. */
@@ -203,6 +226,9 @@ export async function connectPinned(url: string | URL, pinnedIP: string, init: S
   };
 
   return new Promise<Response>((resolvePromise, reject) => {
+    let settled = false;
+    const finish = (fn: () => void) => { if (settled) return; settled = true; clearTimeout(deadline); fn(); };
+
     const req = httpsRequest(
       {
         hostname: u.hostname, // keeps the Host header and the TLS servername (SNI + cert check) on the real name
@@ -210,7 +236,7 @@ export async function connectPinned(url: string | URL, pinnedIP: string, init: S
         path: u.pathname + (u.search || ""),
         method: init.method ?? (bodyBuf ? "POST" : "GET"),
         headers,
-        timeout: limits.timeoutMs,
+        timeout: limits.timeoutMs, // an IDLE timeout only — see the absolute `deadline` below for the wall-clock bound a trickling server can't evade
         agent: false, // a fresh socket every time — never reuse a pooled connection across a different pinned IP
         ...(tls.ca ? { ca: tls.ca } : {}),
         lookup,
@@ -219,28 +245,36 @@ export async function connectPinned(url: string | URL, pinnedIP: string, init: S
       (res) => {
         if ((res.statusCode ?? 0) >= 300 && (res.statusCode ?? 0) < 400) {
           res.resume();
-          reject(new SsrfBlockedError(`upstream returned a redirect (${res.statusCode}); redirects are never followed`));
+          finish(() => reject(new SsrfBlockedError(`upstream returned a redirect (${res.statusCode}); redirects are never followed`)));
           return;
         }
         const declared = Number(res.headers["content-length"] ?? 0);
-        if (declared > limits.maxBytes) { res.resume(); reject(new Error(`response declares ${declared} bytes; the limit is ${limits.maxBytes}`)); return; }
+        if (declared > limits.maxBytes) { res.resume(); finish(() => reject(new Error(`response declares ${declared} bytes; the limit is ${limits.maxBytes}`))); return; }
         const chunks: Buffer[] = [];
         let total = 0;
         res.on("data", (chunk: Buffer) => {
           total += chunk.length;
-          if (total > limits.maxBytes) { req.destroy(); res.destroy(); reject(new Error(`response exceeded the ${limits.maxBytes}-byte cap`)); return; }
+          if (total > limits.maxBytes) { finish(() => reject(new Error(`response exceeded the ${limits.maxBytes}-byte cap`))); req.destroy(); res.destroy(); return; }
           chunks.push(chunk);
         });
         res.on("end", () => {
           const outHeaders = new Headers();
           for (const [k, v] of Object.entries(res.headers)) if (v !== undefined) outHeaders.set(k, Array.isArray(v) ? v.join(", ") : v);
-          resolvePromise(new Response(Buffer.concat(chunks), { status: res.statusCode ?? 0, headers: outHeaders }));
+          finish(() => resolvePromise(new Response(Buffer.concat(chunks), { status: res.statusCode ?? 0, headers: outHeaders })));
         });
-        res.on("error", reject);
+        res.on("error", (err) => finish(() => reject(err)));
       },
     );
+    // An ABSOLUTE wall-clock deadline for the whole request, independent of socket activity: the
+    // `timeout` option above is an idle timeout that resets on every byte, so a server that
+    // trickles one byte at a time (never idle long enough to trip it, never enough bytes to trip
+    // the size cap) would otherwise hold the connection open indefinitely.
+    const deadline = setTimeout(() => {
+      finish(() => reject(new Error(`request to "${u.hostname}" exceeded its ${limits.timeoutMs}ms deadline`)));
+      req.destroy();
+    }, limits.timeoutMs);
     req.on("timeout", () => req.destroy(new Error(`request to "${u.hostname}" timed out after ${limits.timeoutMs}ms`)));
-    req.on("error", reject);
+    req.on("error", (err) => finish(() => reject(err)));
     req.end(bodyBuf);
   });
 }
@@ -254,6 +288,19 @@ export async function connectPinned(url: string | URL, pinnedIP: string, init: S
 export async function ssrfSafeFetch(url: string | URL, init: SsrfFetchInit = {}, limits: FetchLimits = DEFAULT_FETCH_LIMITS, resolver: Resolver = systemResolver): Promise<Response> {
   const u = typeof url === "string" ? new URL(url) : url;
   if (u.protocol !== "https:") throw new SsrfBlockedError(`only https is allowed, got "${u.protocol}"`);
+  // 443 only: an arbitrary client-chosen port is a TLS-handshake probe primitive against any port
+  // on any public host reachable from this box.
+  const port = u.port ? Number(u.port) : 443;
+  if (port !== 443) throw new SsrfBlockedError(`only port 443 is allowed, got "${port}"`);
+  // An IP-literal hostname is refused outright, explicitly — not merely because a DNS resolver
+  // happens to return nothing for one (accidental, and resolver-dependent): no valid Rocket.Chat
+  // TLS certificate is ever issued for a bare IP address, and skipping that check here would be
+  // the one path left where the deny list runs by luck instead of by design.
+  // A URL's `.hostname` keeps the brackets for an IPv6 literal (e.g. "[::1]"), unlike a bare resolved address.
+  const bareHost = u.hostname.replace(/^\[|\]$/g, "");
+  if (ipv4ToInt(bareHost) !== null || ipv6ToBigInt(bareHost) !== null) {
+    throw new SsrfBlockedError(`"${u.hostname}" is an IP-literal host, which is always refused`);
+  }
   const pinnedIP = await checkedAddress(u.hostname, resolver);
   return connectPinned(u, pinnedIP, init, limits);
 }

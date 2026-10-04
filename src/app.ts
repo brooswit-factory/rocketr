@@ -4,7 +4,6 @@ import type { Config } from "./config.js";
 import type { Subscription } from "./rocketchat.js";
 import { Batcher, Watcher, toFrame, type InboundEvent } from "./watcher.js";
 import { buildTools, instrument, type AccountHandle } from "./tools.js";
-import { Presence } from "./presence.js";
 import { page } from "./web.js";
 import { Activity } from "./activity.js";
 import { isLoopbackAddress } from "./auth.js";
@@ -18,6 +17,16 @@ import { redactHeaders, targetHost } from "./redact.js";
 import type { FetchLimits, Resolver } from "./ssrf.js";
 
 export const VERSION = "1.0.0";
+
+/**
+ * No presence (the "online" dot) in this version: presence.ts opens a raw WebSocket to the
+ * client-supplied URL using the system DNS resolver directly, bypassing the SSRF guard entirely —
+ * a hostname that answers public to the guarded `/me` call and private to the WebSocket connect
+ * (DNS rebinding) would get an unguarded, unpinned outbound connection to an internal address and
+ * port. Fixing that (open the socket through the same pinned, deny-checked path as everything
+ * else) is real work on a secondary feature, not blocking for a first stateless-proxy cut — see
+ * FACTORY-644. An agent's online status in Rocket.Chat is simply unavailable in proxy mode for now.
+ */
 
 /** Undelivered frames kept per credential key for sessions that connect later. */
 const PENDING_MAX = 50;
@@ -54,7 +63,6 @@ export interface Rocketr {
 export interface CreateRocketrDeps {
   /** Test-only: replaces the SSRF-guarded fetch entirely (e.g. to point at a fake Rocket.Chat). Never set in production. */
   fetch?: typeof fetch;
-  presence?: (options: ConstructorParameters<typeof Presence>[0]) => Pick<Presence, "setListening" | "stop">;
   /** Source address of an incoming request, before X-Forwarded-For resolution. Default: the real peer via Bun. */
   requestIP?: (req: Request) => string | undefined;
   checkAccess?: CheckAccess;
@@ -81,7 +89,6 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
   const counters = new RequestCounters({ perIPAlertThreshold: deps.alertThresholdPerIP ?? DEFAULT_ALERT_THRESHOLD_PER_IP, log });
 
   const pending: Pending[] = [];
-  const presences = new Map<string, Pick<Presence, "setListening" | "stop">>();
   const batchers = new Map<string, Batcher>();
   let delivering = Promise.resolve(0);
 
@@ -130,11 +137,6 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
     session.watcher = watcher;
     watcher.start();
 
-    presences.set(key, (deps.presence ?? ((options) => new Presence(options)))({
-      url: session.creds.url, userId: session.creds.userId, token: session.creds.token,
-      log: (message) => log(`@${session.self.username}: ${message}`),
-    }));
-
     void (async () => {
       try { for (const sub of await session.rc.subscriptions()) await adopt(session, sub); }
       catch (err) { log(`@${session.self.username}: cannot list rooms: ${(err as Error).message}`); }
@@ -144,8 +146,6 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
   const onTeardownSession = (session: Session) => {
     void batchers.get(session.key)?.flushAll();
     batchers.delete(session.key);
-    presences.get(session.key)?.stop();
-    presences.delete(session.key);
     log(`@${session.self.username}: session torn down (idle grace period elapsed)`);
   };
 
@@ -245,16 +245,10 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
     }, { dir: cfg.attachmentDir, maxBytes: cfg.attachmentMaxBytes, allowedTypes: cfg.attachmentTypes })), activity),
   });
 
-  const syncPresence = (c: Connection) => {
-    const key = credentialKey(connectionCredentials(c.headers));
-    presences.get(key)?.setListening(mcp.connections.filter((conn) =>
-      credentialKey(connectionCredentials(conn.headers)) === key && conn.headers["x-rocketr-channel"] === "on").length > 0);
-  };
   mcp.on("connect", (c) => {
     const key = credentialKey(connectionCredentials(c.headers));
     const session = sessions.get(key);
     activity.connected(c, session?.self.username ?? "?");
-    syncPresence(c);
   });
   mcp.on("disconnect", (c, reason) => {
     activity.record({ type: "disconnect", agentId: c.id, reason });
@@ -263,7 +257,6 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
     sessions.release(key);
     limiter.removeConnection(ip, key);
     toolLimiter.forget(c.id);
-    syncPresence(c);
   });
 
   /**
@@ -349,7 +342,6 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
       for (const batcher of batchers.values()) await batcher.flushAll();
       sessions.stopAll();
       await mcp.closeAll();
-      for (const presence of presences.values()) presence.stop();
       await app.stop(true); // close open observer streams too
     },
   };

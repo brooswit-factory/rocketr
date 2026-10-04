@@ -10,7 +10,6 @@ import { DEFAULT_ATTACHMENT_TYPES } from "../../src/attachment-types.js";
 
 let rcServer: FakeRocketChat, r: Rocketr, dir: string, base: string;
 const conns: FakeConnection[] = [];
-const presenceStates = new Map<string, boolean>();
 
 /** The header set's URL is https:// (so header validation is exercised honestly); this test-only
  * fetch override rewrites it back to the fake server's real http:// transport. Never used in production. */
@@ -29,10 +28,6 @@ const baseConfig = (): Config => ({ host: "127.0.0.1", port: 0, attachmentDir: d
 async function spin(deps: CreateRocketrDeps = {}, cfg: Partial<Config> = {}) {
   const rr = await createRocketr({ ...baseConfig(), ...cfg }, {
     fetch: toHttp,
-    presence: ({ userId }) => ({
-      setListening: (value) => presenceStates.set(userId, value),
-      stop: () => presenceStates.set(userId, false),
-    }),
     gracePeriodMs: 30,
     ...deps,
   });
@@ -43,7 +38,6 @@ async function spin(deps: CreateRocketrDeps = {}, cfg: Partial<Config> = {}) {
 beforeEach(async () => {
   rcServer = new FakeRocketChat().start();
   dir = await mkdtemp(join(tmpdir(), "rocketr-att-"));
-  presenceStates.clear();
   const spun = await spin();
   r = spun.rr;
   base = spun.url;
@@ -169,24 +163,6 @@ describe("stateless credential sessions", () => {
     await Bun.sleep(80); // past the 30ms test grace period
     expect(r.sessions()).toHaveLength(0);
   });
-});
-
-test("presence follows channel sessions per credential key and survives overlapping sessions", async () => {
-  await connect();
-  expect(presenceStates.get("bot1")).toBe(false);
-  const a = await connect(ON);
-  const b = await connect(ON);
-  const lead = await connect({ ...ON, ...LEAD() });
-  expect(presenceStates.get("bot1")).toBe(true);
-  expect(presenceStates.get("bot2")).toBe(true);
-  await a.disconnect();
-  await Bun.sleep(20);
-  expect(presenceStates.get("bot1")).toBe(true);
-  await b.disconnect();
-  await Bun.sleep(20);
-  expect(presenceStates.get("bot1")).toBe(false);
-  expect(presenceStates.get("bot2")).toBe(true);
-  await lead.disconnect();
 });
 
 describe("channel", () => {

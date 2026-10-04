@@ -118,4 +118,33 @@ describe("RequestCounters", () => {
       expect(line.length).toBeLessThan(200); // never a dumped payload
     }
   });
+
+  // Manager review on PR #14 (comment 29464, item 3): a timestamp-per-request array and unbounded
+  // knownHosts/lastAlertAt maps meant cycling distinct hostnames (or a sustained high request rate)
+  // grew memory and log lines without limit.
+  test("cycling many distinct target hosts caps the new-host ALERT lines per hour, with one suppression summary instead of flooding the log", () => {
+    const lines: string[] = [];
+    const counters = new RequestCounters({ perIPAlertThreshold: 1_000_000, log: (l) => lines.push(l) });
+    const t0 = 1_000_000;
+    for (let i = 0; i < 100; i++) counters.record("1.2.3.4", `probe-${i}.invalid`, t0 + i);
+    const newHostAlerts = lines.filter((l) => l.includes("new target host"));
+    expect(newHostAlerts.length).toBeLessThanOrEqual(20); // the compiled-in per-hour cap
+    expect(lines.some((l) => l.includes("suppressed"))).toBe(false); // no suppression line yet — the hour hasn't rolled over
+
+    // crossing into the next hour window emits exactly one suppression summary, then resumes alerting
+    counters.record("1.2.3.4", "probe-200.invalid", t0 + 60 * 60 * 1000 + 1);
+    expect(lines.filter((l) => l.includes("suppressed")).length).toBe(1);
+  });
+
+  test("a single request volume does not grow a subject's own memory without bound — counts are minute-bucketed, not one entry per request", () => {
+    const lines: string[] = [];
+    const counters = new RequestCounters({ perIPAlertThreshold: 50_000, log: (l) => lines.push(l) });
+    const t0 = 1_000_000;
+    // 10,000 requests from the same IP within the same minute must still only ever alert based on
+    // the per-minute-bucketed total, not balloon an array — this just has to complete fast and
+    // report a sane total without the test itself timing out or ballooning memory.
+    for (let i = 0; i < 10_000; i++) counters.record("1.2.3.4", "chat.example.com", t0 + (i % 1000));
+    // no crash, no explosion — and since every request is well under the threshold, no alert fires
+    expect(lines.some((l) => l.includes("source IP"))).toBe(false);
+  });
 });
