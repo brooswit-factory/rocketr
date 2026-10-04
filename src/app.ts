@@ -330,6 +330,7 @@ export async function createRocketr(cfg: Config, deps: CreateRocketrDeps = {}): 
         username: s.self.username,
         connections: s.refCount,
         health: s.watcher?.health() ?? null,
+        rooms: s.watcher?.rooms() ?? null,
         noChannelConnection: listening(s.key).length === 0,
       })),
       version: VERSION,

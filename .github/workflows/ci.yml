@@ -15,3 +15,8 @@ jobs:
       - run: bun test test/unit
       - name: installer renders a unit systemd accepts
         run: bash -n scripts/install.sh
+  release-gate:
+    uses: brooswit-factory/release-gate/.github/workflows/gate.yml@v1
+    with:
+      gated-paths: '["^src/", "^schema/", "^package\\.json$"]'
+      version-file: 'package.json'

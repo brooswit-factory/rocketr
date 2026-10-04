@@ -58,7 +58,16 @@ export interface Subscription {
   tunread?: string[];
 }
 
-export interface Room { _id: string; t: RoomType; name?: string; fname?: string }
+export interface Room {
+  _id: string;
+  t: RoomType;
+  name?: string;
+  fname?: string;
+  /** Bumped by Rocket.Chat on every post to the room, unlike a subscription's own `_updatedAt` (which a
+   * mentions-only `Unread_Count` setting can leave untouched for a plain message). */
+  _updatedAt?: string;
+  lastMessage?: Message;
+}
 
 export class RocketChatError extends Error {
   constructor(readonly status: number, readonly path: string, message: string) {
@@ -99,6 +108,14 @@ export class RocketChat {
   /** Subscriptions changed since `since` (all of them when omitted). */
   async subscriptions(since?: Date) {
     return (await this.call<{ update: Subscription[] }>("subscriptions.get", { query: { updatedSince: since?.toISOString() } })).update;
+  }
+
+  /**
+   * Rooms with activity since `since` (all of them when omitted): `_updatedAt` moves on every post, including a
+   * plain channel message that a mentions-only `Unread_Count` setting would leave invisible to `subscriptions.get`.
+   */
+  async rooms(since?: Date) {
+    return (await this.call<{ update: Room[] }>("rooms.get", { query: { updatedSince: since?.toISOString() } })).update;
   }
 
   async subscription(rid: string) {

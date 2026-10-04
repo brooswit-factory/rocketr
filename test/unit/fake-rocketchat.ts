@@ -13,6 +13,12 @@ export class FakeRocketChat {
   /** Each bot's DM room with a given user. */
   private readonly dms: Record<string, Record<string, string>> = { bot1: { boss: "dm-boss", lead: "dm-agents" }, bot2: { boss: "dm-boss-lead", claude: "dm-agents" } };
   readonly subs = new Map<string, Subscription[]>();
+  /** A room's own last-activity timestamp, bumped by every post regardless of `mentionsOnlyUnread` — what
+   * `rooms.get` reports, mirroring the real server's `_updatedAt`. */
+  readonly roomUpdatedAt = new Map<string, string>();
+  /** Simulates a server with `Unread_Count = mentions` (or any non-"all_messages" setting): a plain post
+   * (no @mention, not a DM) never bumps the recipient's own subscription — only `rooms.get` sees it move. */
+  mentionsOnlyUnread = false;
   readonly messages: Message[] = [];
   readonly sent: Array<{ rid: string; msg: string; tmid?: string }> = [];
   readonly reactions: Array<{ uid: string; messageId: string; emoji: string; shouldReact: boolean }> = [];
@@ -34,17 +40,29 @@ export class FakeRocketChat {
     this.subs.set("bot1", [sub("GENERAL", "general", "c"), sub("dm-boss", "boss", "d"), sub("dm-agents", "lead", "d")]);
     this.subs.set("bot2", [sub("GENERAL", "general", "c"), sub("dm-boss-lead", "boss", "d"), sub("dm-agents", "claude", "d")]);
     this.groupMembers.set("PRIVATE", new Set(["bot1"])); // claude is in; lead is not
+    for (const r of this.rooms) this.roomUpdatedAt.set(r._id, at);
   }
 
   get url() { return `http://127.0.0.1:${this.server.port}`; }
 
-  /** Someone posts; bumps every member's subscription like the real server does. */
+  /**
+   * Someone posts. The room's own activity timestamp always moves. A subscription's `_updatedAt` (and its
+   * `unread` count) moves too, UNLESS `mentionsOnlyUnread` is set and this post is a plain message to a
+   * non-DM subscriber it doesn't @mention — the real-world "Unread_Count = mentions" misconfiguration this
+   * watcher must not depend on.
+   */
   post(rid: string, username: string, msg: string, extra: Partial<Message> = {}) {
     const u = this.users.find((x) => x.username === username)!;
     const ts = new Date().toISOString();
     const m: Message = { _id: `m${++this.n}`, rid, msg, ts, _updatedAt: ts, u, ...extra };
     this.messages.push(m);
-    for (const list of this.subs.values()) for (const s of list) if (s.rid === rid) { s.unread++; s._updatedAt = ts; }
+    this.roomUpdatedAt.set(rid, ts);
+    for (const [subUid, list] of this.subs) for (const s of list) {
+      if (s.rid !== rid) continue;
+      const mentioned = s.t === "d" || (m.mentions?.some((x) => x._id === subUid || x._id === "all" || x._id === "here") ?? false);
+      if (this.mentionsOnlyUnread && !mentioned) continue;
+      s.unread++; s._updatedAt = ts;
+    }
     return m;
   }
 
@@ -72,6 +90,15 @@ export class FakeRocketChat {
       case "me": return json({ success: true, ...me });
       case "users.info": { const u = this.users.find((x) => x.username === q("username")); return u ? json({ success: true, user: u }) : json({ success: false, error: "User not found." }, 400); }
       case "subscriptions.get": { const since = q("updatedSince"); return json({ success: true, update: (this.subs.get(uid) ?? []).filter((s) => !since || s._updatedAt > since) }); }
+      case "rooms.get": {
+        const since = q("updatedSince");
+        const mine = new Set((this.subs.get(uid) ?? []).map((s) => s.rid));
+        const update = this.rooms
+          .filter((r) => mine.has(r._id))
+          .map((r) => ({ ...r, _updatedAt: this.roomUpdatedAt.get(r._id) ?? new Date(0).toISOString() }))
+          .filter((r) => !since || r._updatedAt > since);
+        return json({ success: true, update });
+      }
       case "chat.syncMessages": return json({ success: true, result: { updated: this.messages.filter((m) => m.rid === q("roomId") && m._updatedAt > q("lastUpdate")!), deleted: [] } });
       case "channels.history": case "im.history": case "groups.history":
         return json({ success: true, messages: this.messages.filter((m) => m.rid === q("roomId")).reverse().slice(0, Number(q("count"))) });

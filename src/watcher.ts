@@ -77,16 +77,33 @@ export interface WatcherOptions {
   log?: (msg: string) => void;
 }
 
-type Source = Pick<RocketChat, "subscriptions" | "syncMessages">;
+type Source = Pick<RocketChat, "subscriptions" | "syncMessages" | "rooms">;
 
 /** How far back to look on each poll, to cover clock skew between us and the server. Duplicates are dropped by id. */
 const OVERLAP_MS = 5_000;
 const SEEN_MAX = 2_000;
 
+export interface UnsyncedRoom {
+  room: string;
+  lastActivityAt: string;
+  lastSyncedAt: string | null;
+}
+
 export class Watcher {
   readonly startedAt: Date;
   private subsSince: Date;
+  private roomsSince: Date;
+  private subsSeeded = false;
+  /** Every room this account is known to belong to, keyed by room id — seeded once in full, then kept current by
+   * `subscriptions.get`'s own deltas (level, mute and join/leave changes). */
+  private readonly subs = new Map<string, Subscription>();
+  /** Last `rooms.get` activity timestamp seen for a room — moves on every post, unlike a subscription's own
+   * `_updatedAt` under a mentions-only `Unread_Count` setting. */
+  private readonly lastActivityAt = new Map<string, Date>();
+  /** Last time messages were actually synced for a room. */
   private readonly roomSince = new Map<string, Date>();
+  /** Activity timestamp already logged as unsynced for a room, so a stuck room warns once, not every poll. */
+  private readonly warnedActivityAt = new Map<string, string>();
   private readonly seen = new Set<string>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
@@ -98,26 +115,69 @@ export class Watcher {
     return { running: this.running, consecutiveFailures: this.failures, lastSuccessAt: this.lastSuccessAt?.toISOString() ?? null };
   }
 
+  /** Per-room sync state for the observer app (FACTORY-645): how many rooms are tracked, and any at level
+   * "all" whose `rooms.get` activity hasn't been matched by a message sync yet. */
+  rooms(): { tracked: number; unsyncedActive: UnsyncedRoom[] } {
+    const unsyncedActive: UnsyncedRoom[] = [];
+    for (const [rid, activity] of this.lastActivityAt) {
+      const sub = this.subs.get(rid);
+      if (!sub || levelOf(sub, this.o.fallback) !== "all") continue;
+      const synced = this.roomSince.get(rid);
+      if (synced && synced >= activity) continue;
+      unsyncedActive.push({ room: sub.fname || sub.name, lastActivityAt: activity.toISOString(), lastSyncedAt: synced?.toISOString() ?? null });
+    }
+    return { tracked: this.subs.size, unsyncedActive };
+  }
+
   constructor(private readonly rc: Source, private readonly o: WatcherOptions) {
     this.startedAt = (o.now ?? (() => new Date()))();
     this.subsSince = this.startedAt;
+    this.roomsSince = this.startedAt;
   }
 
-  /** One poll. Only messages created after the watcher started are considered — restarts never replay history. */
+  /**
+   * One poll. Only messages created after the watcher started are considered — restarts never replay history.
+   * `subscriptions.get` still drives level, mute and join/leave changes; activity is detected with
+   * `rooms.get?updatedSince` instead (a room's `_updatedAt` moves on every post, so a plain channel message is
+   * never missed just because the server counts it as read without a mention). One extra REST call per poll.
+   */
   async tick(): Promise<InboundEvent[]> {
-    const subs = await this.rc.subscriptions(back(this.subsSince));
-    const events: InboundEvent[] = [];
+    const subs = this.subsSeeded ? await this.rc.subscriptions(back(this.subsSince)) : await this.rc.subscriptions();
+    this.subsSeeded = true;
     for (const sub of subs) {
       if (sub._updatedAt > this.subsSince.toISOString()) this.subsSince = new Date(sub._updatedAt);
       await this.o.onSubscription?.(sub);
-      const since = this.roomSince.get(sub.rid) ?? this.startedAt;
-      const msgs = (await this.rc.syncMessages(sub.rid, back(since))).sort((a, b) => a.ts.localeCompare(b.ts));
+      this.subs.set(sub.rid, sub);
+    }
+
+    const rooms = await this.rc.rooms(back(this.roomsSince));
+    for (const r of rooms) {
+      const updatedAt = r._updatedAt ?? r.lastMessage?._updatedAt;
+      if (!updatedAt) continue;
+      if (updatedAt > this.roomsSince.toISOString()) this.roomsSince = new Date(updatedAt);
+      if (!this.subs.has(r._id)) continue; // not a member we track (or membership not yet known)
+      this.lastActivityAt.set(r._id, new Date(updatedAt));
+    }
+
+    const events: InboundEvent[] = [];
+    for (const [rid, sub] of this.subs) {
+      const activity = this.lastActivityAt.get(rid);
+      const since = this.roomSince.get(rid) ?? this.startedAt;
+      if (!activity || activity <= since) continue;
+      const msgs = (await this.rc.syncMessages(rid, back(since))).sort((a, b) => a.ts.localeCompare(b.ts));
+      let caughtUpTo = since;
       for (const m of msgs) {
-        if (m._updatedAt > since.toISOString()) this.roomSince.set(sub.rid, new Date(m._updatedAt));
+        const updatedAt = new Date(m._updatedAt);
+        if (updatedAt > caughtUpTo) caughtUpTo = updatedAt;
         if (m.ts < this.startedAt.toISOString() || this.seen.has(m._id)) continue; // edits of old messages, repeats
         this.remember(m._id);
         const e = classify(m, sub, this.o.self, this.o.fallback);
         if (e) events.push(e);
+      }
+      this.roomSince.set(rid, caughtUpTo);
+      if (caughtUpTo < activity && levelOf(sub, this.o.fallback) === "all" && this.warnedActivityAt.get(rid) !== activity.toISOString()) {
+        this.warnedActivityAt.set(rid, activity.toISOString());
+        this.o.log?.(`room "${sub.fname || sub.name}" shows activity at ${activity.toISOString()} the watcher could not sync (last synced ${caughtUpTo.toISOString()})`);
       }
     }
     for (const e of events) await this.o.onEvent(e);

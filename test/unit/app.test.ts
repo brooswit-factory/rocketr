@@ -186,6 +186,16 @@ describe("channel", () => {
     expect((await c.nextFrame(5000)).meta).toMatchObject({ kind: "thread", thread_id: "t1" });
   }, 10_000);
 
+  test("a plain channel post still lands at level \"all\" even when the server's Unread_Count is mentions-only (FACTORY-645, GH #5)", async () => {
+    rcServer.mentionsOnlyUnread = true; // the subscription's own _updatedAt never moves for this post
+    const c = await connect(ON);
+    await Bun.sleep(80);
+    rcServer.post("GENERAL", "rando", "no mention here, just chatting");
+    const f = await c.nextFrame(5000);
+    expect(f.content).toBe("no mention here, just chatting");
+    expect(f.meta).toMatchObject({ kind: "channel", sender: "rando", room_id: "GENERAL" });
+  }, 10_000);
+
   test("a message that arrives with a tools-only (non-channel) session keeping the session alive waits, then lands once a channel session connects", async () => {
     // The session (and its watcher) only exists while at least one connection for its credential is
     // open — a tools-only connection is enough to keep polling going, even though it isn't itself
@@ -298,6 +308,17 @@ describe("web app", () => {
     const s = await (await fetch(base + "/api/snapshot")).json() as any;
     expect(s.sessions[0].health).toMatchObject({ running: true, consecutiveFailures: 0 });
   });
+
+  test("snapshot exposes per-session room tracking, with no unsynced rooms once a plain post is caught up (FACTORY-645)", async () => {
+    rcServer.mentionsOnlyUnread = true;
+    const c = await connect(ON);
+    await Bun.sleep(80);
+    rcServer.post("GENERAL", "rando", "catch this");
+    await c.nextFrame(5000);
+    const s = await (await fetch(base + "/api/snapshot")).json() as any;
+    expect(s.sessions[0].rooms.tracked).toBeGreaterThan(0);
+    expect(s.sessions[0].rooms.unsyncedActive).toEqual([]);
+  }, 10_000);
 
   test("the stream carries tool calls live", async () => {
     const res = await fetch(base + "/api/stream");

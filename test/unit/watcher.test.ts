@@ -112,9 +112,14 @@ describe("Batcher", () => {
 
 describe("Watcher.tick", () => {
   const start = new Date("2030-01-01T00:00:00.000Z");
-  const source = (subs: Subscription[], byRoom: Record<string, Message[]>) => ({
+  /** A room's activity defaults to the newest message seen for it, like the real `rooms.get` — override
+   * per test (`rooms`) for a server whose room activity has moved independently of what `byRoom` carries. */
+  const source = (subs: Subscription[], byRoom: Record<string, Message[]>, rooms?: Array<{ _id: string; t: "c"; _updatedAt: string }>) => ({
     subscriptions: async () => subs,
     syncMessages: async (rid: string) => byRoom[rid] ?? [],
+    rooms: async () => rooms ?? Object.entries(byRoom).map(([_id, msgs]) => ({
+      _id, t: "c" as const, _updatedAt: msgs.reduce((max, m) => (m._updatedAt > max ? m._updatedAt : max), "1970-01-01T00:00:00.000Z"),
+    })),
   });
 
   test("emits events once, skips messages from before start, dedupes repeats across polls", async () => {
@@ -141,11 +146,62 @@ describe("Watcher.tick", () => {
 
   test("start/stop survive a failing source and log it", async () => {
     const logs: string[] = [];
-    const w = new Watcher({ subscriptions: async () => { throw new Error("down"); }, syncMessages: async () => [] },
+    const w = new Watcher({ subscriptions: async () => { throw new Error("down"); }, syncMessages: async () => [], rooms: async () => [] },
       { self, fallback: "all", pollMs: 5, onEvent: async () => {}, log: (m) => logs.push(m) });
     w.start(); w.start();
     await Bun.sleep(30);
     w.stop();
     expect(logs[0]).toContain("poll failed (1x): down");
+  });
+});
+
+describe("Watcher.tick: activity detected via rooms.get (FACTORY-645)", () => {
+  const start = new Date("2030-01-01T00:00:00.000Z");
+
+  test("a plain channel post that never bumps the subscription (mentions-only Unread_Count) is still synced", async () => {
+    const plain = msg(boss, "lunch?"); // level "all", no mention — the kind the server's mentions-only mode drops
+    const got: InboundEvent[] = [];
+    // chan's own _updatedAt stays at its original value: the subscription never moved, only the room did.
+    const w = new Watcher(
+      { subscriptions: async () => [chan], syncMessages: async (rid) => (rid === "c1" ? [plain] : []), rooms: async () => [{ _id: "c1", t: "c", _updatedAt: plain._updatedAt }] },
+      { self, fallback: "all", pollMs: 10, now: () => start, onEvent: async (e) => { got.push(e); } },
+    );
+    await w.tick();
+    expect(got.map((e) => e.message.msg)).toEqual(["lunch?"]);
+  });
+
+  test("a room with no rooms.get activity is never re-synced, even if its subscription is present", async () => {
+    const calls: string[] = [];
+    const w = new Watcher(
+      { subscriptions: async () => [chan], syncMessages: async (rid) => { calls.push(rid); return []; }, rooms: async () => [] },
+      { self, fallback: "all", pollMs: 10, now: () => start, onEvent: async () => {} },
+    );
+    await w.tick();
+    expect(calls).toEqual([]);
+  });
+
+  test("rooms() reports a level-all room whose activity sync is lagging, and tick() warns once for it", async () => {
+    const logs: string[] = [];
+    const activity = "2030-01-01T00:05:00.000Z";
+    const w = new Watcher(
+      // syncMessages never returns the message that caused the activity — simulates a sync that can't catch up.
+      { subscriptions: async () => [chan], syncMessages: async () => [], rooms: async () => [{ _id: "c1", t: "c", _updatedAt: activity }] },
+      { self, fallback: "all", pollMs: 10, now: () => start, onEvent: async () => {}, log: (m) => logs.push(m) },
+    );
+    await w.tick();
+    expect(w.rooms()).toMatchObject({ tracked: 1, unsyncedActive: [{ room: "general", lastActivityAt: activity }] });
+    expect(logs.some((m) => m.includes("general") && m.includes("could not sync"))).toBe(true);
+    await w.tick(); // still stuck, but the same activity timestamp must not warn twice
+    expect(logs.filter((m) => m.includes("could not sync"))).toHaveLength(1);
+  });
+
+  test("rooms() tracked counts every known room; unsyncedActive stays empty once level is not \"all\"", async () => {
+    const quiet = { ...chan, desktopNotifications: "mentions" as const };
+    const w = new Watcher(
+      { subscriptions: async () => [quiet, dm], syncMessages: async () => [], rooms: async () => [{ _id: "c1", t: "c", _updatedAt: "2030-01-01T00:05:00.000Z" }] },
+      { self, fallback: "all", pollMs: 10, now: () => start, onEvent: async () => {} },
+    );
+    await w.tick();
+    expect(w.rooms()).toEqual({ tracked: 2, unsyncedActive: [] });
   });
 });
