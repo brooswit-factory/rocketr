@@ -16,7 +16,7 @@ import { ConnectionLimiter, ToolCallLimiter, RequestCounters, DEFAULT_LIMITS, ty
 import { redactHeaders, targetHost } from "./redact.js";
 import type { FetchLimits, Resolver } from "./ssrf.js";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.1.1";
 
 /**
  * No presence (the "online" dot) in this version: presence.ts opens a raw WebSocket to the
